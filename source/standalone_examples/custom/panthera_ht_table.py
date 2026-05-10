@@ -1,3 +1,4 @@
+from __future__ import annotations
 import argparse
 import hashlib
 import json
@@ -6,6 +7,8 @@ import os
 import re
 import shutil
 import struct
+import subprocess
+import sys
 import time
 import zlib
 from pathlib import Path
@@ -27,16 +30,139 @@ def env_int(name: str, default: int = 0) -> int:
     return int(value)
 
 
+def env_float(name: str, default: float = 0.0) -> float:
+    value = os.getenv(name)
+    if not value:
+        return default
+    return float(value)
+
+
+def env_optional_float(name: str) -> float | None:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    return float(value)
+
+
+def env_vector3(name: str, default: list[float] | tuple[float, float, float]) -> np.ndarray:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return np.array(default, dtype=np.float32)
+    parts = [float(part.strip()) for part in value.replace(';', ',').split(',') if part.strip()]
+    if len(parts) != 3:
+        raise ValueError(f"{name} must contain exactly 3 comma-separated floats, got: {value!r}")
+    return np.array(parts, dtype=np.float32)
+
+
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Panthera-HT arm on an 80x80 cm Isaac Sim table.")
     parser.add_argument("--headless", action="store_true", default=env_flag("PANTHERA_HEADLESS"))
     parser.add_argument("--max-frames", type=int, default=env_int("PANTHERA_MAX_FRAMES"))
     parser.add_argument("--no-motion", action="store_true", default=env_flag("PANTHERA_NO_MOTION"))
+    parser.add_argument(
+        "--arm-layout",
+        choices=("dual", "single-front-left", "single-front-right"),
+        default=os.getenv("PANTHERA_ARM_LAYOUT", "dual"),
+        help="Select the Panthera table layout. Single-arm modes omit the other arm and its wrist camera.",
+    )
+    parser.add_argument(
+        "--active-arm-label",
+        choices=("front_left", "front_right"),
+        default=os.getenv("PANTHERA_ACTIVE_ARM_LABEL", "front_left"),
+        help="Arm used for the 7D single-arm SmolVLA policy and rollout metrics.",
+    )
+    parser.add_argument(
+        "--enable-smolvla-policy",
+        action="store_true",
+        default=env_flag("PANTHERA_ENABLE_SMOLVLA_POLICY"),
+        help="Load the trained 7D SmolVLA checkpoint through an external LeRobot Python helper.",
+    )
+    parser.add_argument("--smolvla-model-id", default=os.getenv("PANTHERA_SMOLVLA_MODEL_ID", ""))
+    parser.add_argument(
+        "--smolvla-python",
+        default=os.getenv("PANTHERA_SMOLVLA_PYTHON", "/home/wmj/miniconda3/envs/deeplearning/bin/python"),
+    )
+    parser.add_argument("--smolvla-device", default=os.getenv("PANTHERA_SMOLVLA_DEVICE", "cuda"))
+    parser.add_argument(
+        "--smolvla-task-text",
+        default=os.getenv("PANTHERA_SMOLVLA_TASK_TEXT", "operate the Panthera arm on the table"),
+    )
+    parser.add_argument("--smolvla-infer-interval", type=int, default=env_int("PANTHERA_SMOLVLA_INFER_INTERVAL", 10))
+    parser.add_argument(
+        "--smolvla-control-mode",
+        choices=("log-only", "front-left", "single-arm", "mirror-both"),
+        default=os.getenv("PANTHERA_SMOLVLA_CONTROL_MODE", "log-only"),
+    )
     parser.add_argument("--urdf", default=os.getenv("PANTHERA_URDF", ""))
     parser.add_argument("--ros2-root", default=os.getenv("PANTHERA_ROS2_ROOT", ""))
     parser.add_argument("--mesh-dir", default=os.getenv("PANTHERA_MESH_DIR", ""))
     parser.add_argument("--table-size", type=float, default=float(os.getenv("PANTHERA_TABLE_SIZE", "0.80")))
     parser.add_argument("--table-height", type=float, default=float(os.getenv("PANTHERA_TABLE_HEIGHT", "0.75")))
+    parser.add_argument(
+        "--enable-single-arm-metrics",
+        action="store_true",
+        default=env_flag("PANTHERA_SINGLE_ARM_METRICS"),
+        help="Write proxy tabletop pushing metrics for single-arm SmolVLA rollouts.",
+    )
+    parser.add_argument(
+        "--success-metric",
+        choices=("proxy-box-displacement", "proxy-cube-displacement", "ee-to-box"),
+        default=os.getenv("PANTHERA_SUCCESS_METRIC", "proxy-box-displacement"),
+    )
+    parser.add_argument(
+        "--success-displacement-threshold",
+        type=float,
+        default=env_float("PANTHERA_SUCCESS_DISPLACEMENT_THRESHOLD", 0.15),
+    )
+    parser.add_argument(
+        "--success-distance-threshold",
+        type=float,
+        default=env_float("PANTHERA_SUCCESS_DISTANCE_THRESHOLD", 0.05),
+    )
+    parser.add_argument("--rollout-id", default=os.getenv("PANTHERA_ROLLOUT_ID", ""))
+    parser.add_argument(
+        "--target-box-xy-jitter",
+        type=float,
+        default=env_float("PANTHERA_TARGET_BOX_XY_JITTER", 0.0),
+        help="Uniform XY reset jitter in meters for evaluation rollouts; 0 preserves the 1:1 nominal scene.",
+    )
+    parser.add_argument("--target-box-x", type=float, default=env_optional_float("PANTHERA_TARGET_BOX_X"))
+    parser.add_argument("--target-box-y", type=float, default=env_optional_float("PANTHERA_TARGET_BOX_Y"))
+    parser.add_argument(
+        "--enable-dataset-action-replay",
+        action="store_true",
+        default=env_flag("PANTHERA_ENABLE_DATASET_ACTION_REPLAY"),
+        help="Replay exported LeRobot 7D dataset actions open-loop on the active single arm.",
+    )
+    parser.add_argument(
+        "--dataset-action-replay-path",
+        default=os.getenv("PANTHERA_DATASET_ACTION_REPLAY_PATH", ""),
+        help="JSON exported by tools/lerobot/export_lerobot_actions.py for open-loop replay ablation.",
+    )
+    parser.add_argument(
+        "--dataset-action-replay-start-index",
+        type=int,
+        default=env_int("PANTHERA_DATASET_ACTION_REPLAY_START_INDEX", 0),
+    )
+    parser.add_argument(
+        "--dataset-action-replay-stride",
+        type=int,
+        default=env_int("PANTHERA_DATASET_ACTION_REPLAY_STRIDE", 1),
+    )
+    parser.add_argument(
+        "--dataset-action-replay-hold-last",
+        action="store_true",
+        default=env_flag("PANTHERA_DATASET_ACTION_REPLAY_HOLD_LAST", True),
+        help="Keep applying the final replay action if max_frames exceeds the exported action count.",
+    )
+    parser.add_argument(
+        "--dataset-action-replay-align-initial-state",
+        action="store_true",
+        default=env_flag("PANTHERA_DATASET_ACTION_REPLAY_ALIGN_INITIAL_STATE"),
+        help="Initialize the active arm from the replay's first state7 before open-loop replay starts.",
+    )
     parser.add_argument("--use-official-grey", action="store_true", default=env_flag("PANTHERA_USE_OFFICIAL_GREY"))
     parser.add_argument(
         "--disable-layout-cameras",
@@ -124,6 +250,9 @@ REAL_LAYOUT_ROBOT_BASE_Z_OFFSET = 0.025
 REAL_LAYOUT_ROBOT_YAW_DEG = 90.0
 REAL_LAYOUT_D435I_HEIGHT_ABOVE_TABLE = 0.60
 REAL_LAYOUT_D435I_DOWNWARD_ANGLE_DEG = 45.0
+REAL_LAYOUT_D435I_TARGET_X_OFFSET_M = -0.22
+REAL_LAYOUT_D435I_TARGET_Y_OFFSET_M = 0.02
+REAL_LAYOUT_D435I_TARGET_Z_OFFSET_M = 0.12
 WRIST_CAMERA_LINK_NAME = "link6"
 LAYOUT_CAMERA_CAPTURE_WARMUP_FRAMES = 24
 WRIST_RGB_CAMERA_RESOLUTION = (640, 480)
@@ -136,6 +265,9 @@ LAYOUT_CAMERA_MOTION_PROOF_WARMUP_FRAMES = 12
 LAYOUT_CAMERA_SEQUENCE_WARMUP_FRAMES = 8
 LIVE_LAYOUT_CAMERA_VIEWPORT_NAMES = ("left_wrist_rgb", "right_wrist_rgb", "d435i_rgb")
 LIVE_LAYOUT_CAMERA_VIEWPORT_SIZE = (640, 480)
+TARGET_BOX_PRIM_PATH = "/World/Table/TargetCube"
+TARGET_BOX_SIZE = np.array([0.10, 0.055, 0.045], dtype=np.float32)
+TARGET_BOX_INITIAL_POSITION = np.array([-0.18, 0.16, 0.75 + TARGET_BOX_SIZE[2] / 2.0 + 0.003], dtype=np.float32)
 D435I_RGB_INTRINSICS = {
     "fx": 611.9111,
     "fy": 612.2362,
@@ -203,6 +335,234 @@ def json_ready(value):
     if isinstance(value, (list, tuple)):
         return [json_ready(item) for item in value]
     return value
+
+
+def panthera_log(message: str) -> None:
+    print(message)
+    carb.log_info(message)
+
+
+def smolvla_output_dir() -> Path:
+    output_dir = repo_root() / "outputs/panthera_ht/smolvla_policy_frames"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def panthera_state7(panthera: Articulation) -> list[float]:
+    positions = actual_joint_positions_by_name(panthera)
+    if "read_error" in positions:
+        raise RuntimeError(f"Unable to read Panthera joint positions for SmolVLA: {positions['read_error']}")
+    finger_values = [positions.get(name) for name in ("L_finger_joint", "R_finger_joint", "L_finger", "R_finger")]
+    valid_fingers = [float(value) for value in finger_values if value is not None]
+    gripper = float(sum(valid_fingers) / len(valid_fingers)) if valid_fingers else 0.0
+    return [float(positions.get(f"joint{joint_index}", 0.0)) for joint_index in range(1, 7)] + [gripper]
+
+
+def smolvla_policy_target_for_dofs(dof_names: list[str], action7: list[float]) -> np.ndarray:
+    if len(action7) < 7:
+        raise RuntimeError(f"SmolVLA action7 is too short: {action7}")
+    targets = {
+        "joint1": float(action7[0]),
+        "joint2": float(action7[1]),
+        "joint3": float(action7[2]),
+        "joint4": float(action7[3]),
+        "joint5": float(action7[4]),
+        "joint6": float(action7[5]),
+        "L_finger": float(np.clip(action7[6], 0.0, 0.04)),
+        "R_finger": float(np.clip(action7[6], 0.0, 0.04)),
+        "L_finger_joint": float(np.clip(action7[6], 0.0, 0.04)),
+        "R_finger_joint": float(np.clip(action7[6], 0.0, 0.04)),
+    }
+    pose = np.zeros((1, len(dof_names)), dtype=np.float32)
+    for dof_index, dof_name in enumerate(dof_names):
+        pose[0, dof_index] = targets.get(dof_name, 0.0)
+    return pose
+
+
+def replay_action_target_for_dofs(dof_names: list[str], action7: list[float]) -> np.ndarray:
+    return smolvla_policy_target_for_dofs(dof_names, action7)
+
+
+def action7_summary(actions: list[list[float]]) -> dict[str, object]:
+    if not actions:
+        return {}
+    array = np.asarray(actions, dtype=np.float64)
+    return {
+        "first_action7": array[0].tolist(),
+        "last_action7": array[-1].tolist(),
+        "min_action7": array.min(axis=0).tolist(),
+        "max_action7": array.max(axis=0).tolist(),
+        "mean_action7": array.mean(axis=0).tolist(),
+        "gripper_clip_count": int(np.count_nonzero((array[:, 6] < 0.0) | (array[:, 6] > 0.04))),
+    }
+
+
+def load_dataset_replay_actions(replay_path: str) -> dict[str, object]:
+    if not replay_path:
+        raise RuntimeError("--enable-dataset-action-replay requires --dataset-action-replay-path")
+    path = Path(replay_path).expanduser()
+    if not path.is_absolute():
+        path = repo_root() / path
+    payload = json.loads(path.read_text())
+    records = payload.get("records")
+    if not isinstance(records, list) or not records:
+        raise RuntimeError(f"Dataset replay file has no records: {path}")
+    actions: list[list[float]] = []
+    states: list[list[float] | None] = []
+    source_frames: list[int | None] = []
+    for record_index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise RuntimeError(f"Replay record {record_index} is not an object")
+        action = record.get("action7")
+        if not isinstance(action, list) or len(action) != 7:
+            raise RuntimeError(f"Replay record {record_index} action7 must be length 7, got {action}")
+        action7 = [float(value) for value in action]
+        if not all(math.isfinite(value) for value in action7):
+            raise RuntimeError(f"Replay record {record_index} action7 has non-finite values: {action7}")
+        actions.append(action7)
+        state = record.get("state7")
+        states.append([float(value) for value in state] if isinstance(state, list) and len(state) == 7 else None)
+        frame_value = record.get("frame_index")
+        source_frames.append(int(frame_value) if frame_value is not None else None)
+    summary = action7_summary(actions)
+    return {
+        "path": path,
+        "payload": payload,
+        "actions": actions,
+        "states": states,
+        "source_frames": source_frames,
+        **summary,
+    }
+
+
+def replay_action_for_frame(replay: dict[str, object], frame_index: int) -> tuple[int, list[float]] | None:
+    actions = replay["actions"]
+    if not isinstance(actions, list) or not actions:
+        return None
+    start_index = max(0, int(args.dataset_action_replay_start_index))
+    stride = max(1, int(args.dataset_action_replay_stride))
+    replay_index = start_index + frame_index * stride
+    if replay_index >= len(actions):
+        if not args.dataset_action_replay_hold_last:
+            return None
+        replay_index = len(actions) - 1
+    return replay_index, list(actions[replay_index])
+
+
+def first_replay_state7(replay: dict[str, object]) -> list[float] | None:
+    states = replay.get("states")
+    if not isinstance(states, list) or not states:
+        return None
+    first_state = states[0]
+    if not isinstance(first_state, list) or len(first_state) != 7:
+        return None
+    return [float(value) for value in first_state]
+
+
+def joint_abs_error_for_target(panthera: Articulation, target_pose: np.ndarray) -> dict[str, object]:
+    actual = actual_joint_positions_by_name(panthera)
+    errors: dict[str, float] = {}
+    for dof_index, dof_name in enumerate(panthera.dof_names):
+        if dof_name in actual:
+            errors[dof_name] = abs(float(target_pose[0, dof_index]) - float(actual[dof_name]))
+    values = list(errors.values())
+    return {
+        "per_joint_abs_error": errors,
+        "max_abs_error": max(values) if values else None,
+        "mean_abs_error": float(sum(values) / len(values)) if values else None,
+    }
+
+
+def active_wrist_camera_name(active_arm_label: str) -> str:
+    return "left_wrist_rgb" if active_arm_label == "front_left" else "right_wrist_rgb"
+
+
+def run_smolvla_policy_inference(
+    frame_index: int,
+    active_panthera: Articulation,
+    layout_cameras: dict[str, Camera],
+    active_arm_label: str,
+) -> list[float] | None:
+    if not args.smolvla_model_id:
+        raise RuntimeError("--enable-smolvla-policy requires --smolvla-model-id or PANTHERA_SMOLVLA_MODEL_ID")
+    wrist_camera_name = active_wrist_camera_name(active_arm_label)
+    if "d435i_rgb" not in layout_cameras or wrist_camera_name not in layout_cameras:
+        raise RuntimeError(f"SmolVLA policy requires layout cameras d435i_rgb and {wrist_camera_name}")
+
+    output_dir = smolvla_output_dir()
+    camera1_path = output_dir / f"frame_{frame_index:06d}_camera1_d435i_rgb.png"
+    camera3_path = output_dir / f"frame_{frame_index:06d}_camera3_{wrist_camera_name}.png"
+    frame_json_path = output_dir / f"frame_{frame_index:06d}.json"
+    result_json_path = output_dir / f"frame_{frame_index:06d}_result.json"
+
+    write_png_rgb(camera1_path, layout_camera_rgb("d435i_rgb", layout_cameras["d435i_rgb"]))
+    write_png_rgb(camera3_path, layout_camera_rgb(wrist_camera_name, layout_cameras[wrist_camera_name]))
+    state7 = panthera_state7(active_panthera)
+    frame_payload = {
+        "frame_index": frame_index,
+        "state7": state7,
+        "task": args.smolvla_task_text,
+        "camera1_path": str(camera1_path),
+        "camera3_path": str(camera3_path),
+        "camera1_source": "d435i_rgb",
+        "camera3_source": wrist_camera_name,
+        "active_arm_label": active_arm_label,
+        "state_source": f"{active_arm_label}_7d",
+        "control_mode": args.smolvla_control_mode,
+        "target_box_world_pos": json_ready(safe_world_position_for_prim(TARGET_BOX_PRIM_PATH)),
+    }
+    frame_json_path.write_text(json.dumps(json_ready(frame_payload), ensure_ascii=False, indent=2))
+
+    command = [
+        args.smolvla_python,
+        str(repo_root() / "tools/lerobot/panthera_smolvla_infer.py"),
+        "--model-id",
+        args.smolvla_model_id,
+        "--frame-json",
+        str(frame_json_path),
+        "--output-json",
+        str(result_json_path),
+        "--device",
+        args.smolvla_device,
+        "--task-text",
+        args.smolvla_task_text,
+        "--control-mode",
+        args.smolvla_control_mode,
+        "--frame-index",
+        str(frame_index),
+    ]
+    env = os.environ.copy()
+    env.setdefault("HF_HOME", str(repo_root() / "outputs/hf_runtime_cache"))
+    env.setdefault("HF_DATASETS_CACHE", str(repo_root() / "outputs/hf_runtime_cache/datasets"))
+    env.setdefault("TRANSFORMERS_CACHE", str(repo_root() / "outputs/hf_runtime_cache/transformers"))
+    env.setdefault("HF_HUB_OFFLINE", "1")
+    env.setdefault("TRANSFORMERS_OFFLINE", "1")
+    env.setdefault("HF_HUB_DISABLE_XET", "1")
+
+    panthera_log(
+        f"[Panthera-HT][SmolVLA] Loading checkpoint: {args.smolvla_model_id} "
+        f"device={args.smolvla_device} control_mode={args.smolvla_control_mode}"
+    )
+    panthera_log(
+        f"[Panthera-HT][SmolVLA] Single-arm input mapping: camera1=d435i_rgb "
+        f"camera3={wrist_camera_name} state={active_arm_label}_7d"
+    )
+    panthera_log(f"[Panthera-HT][SmolVLA] Inference frame={frame_index} state7={state7} task={args.smolvla_task_text!r}")
+    completed = subprocess.run(command, cwd=repo_root(), env=env, text=True, capture_output=True, check=False)
+    for line in completed.stdout.splitlines():
+        panthera_log(line)
+    for line in completed.stderr.splitlines():
+        panthera_log(f"[Panthera-HT][SmolVLA][stderr] {line}")
+    if completed.returncode != 0:
+        raise RuntimeError(f"SmolVLA helper failed with exit code {completed.returncode}")
+
+    result = json.loads(result_json_path.read_text())
+    action7 = result.get("predicted_action_step0")
+    if not isinstance(action7, list) or len(action7) < 7:
+        raise RuntimeError(f"SmolVLA helper did not return a valid action7: {action7}")
+    action7 = [float(value) for value in action7[:7]]
+    panthera_log(f"[Panthera-HT][SmolVLA] Predicted action7 frame={frame_index} action={action7}")
+    return action7
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -388,6 +748,22 @@ def real_layout_arm_specs(table_size: float, tabletop_z: float) -> list[dict[str
     ]
 
 
+def canonical_active_arm_label() -> str:
+    if args.arm_layout == "single-front-left":
+        return "front_left"
+    if args.arm_layout == "single-front-right":
+        return "front_right"
+    return args.active_arm_label
+
+
+def selected_layout_arm_specs(table_size: float, tabletop_z: float) -> list[dict[str, object]]:
+    specs = real_layout_arm_specs(table_size, tabletop_z)
+    if args.arm_layout == "dual":
+        return specs
+    selected_label = canonical_active_arm_label()
+    return [spec for spec in specs if spec["label"] == selected_label]
+
+
 def add_table_scene(world: World, table_size: float, table_height: float) -> float:
     tabletop_thickness = 0.06
     tabletop = np.array([table_size, table_size, tabletop_thickness], dtype=np.float32)
@@ -430,7 +806,7 @@ def add_table_scene(world: World, table_size: float, table_height: float) -> flo
         )
 
     plate_size = np.array([0.18, 0.18, 0.02], dtype=np.float32)
-    for arm_spec in real_layout_arm_specs(table_size, table_height):
+    for arm_spec in selected_layout_arm_specs(table_size, table_height):
         mount_position = np.array(arm_spec["position"], dtype=np.float32).copy()
         mount_position[2] = table_height + plate_size[2] / 2.0
         world.scene.add(
@@ -444,15 +820,32 @@ def add_table_scene(world: World, table_size: float, table_height: float) -> flo
             )
         )
 
-    cube_size = 0.045
+    box_position = TARGET_BOX_INITIAL_POSITION.copy()
+    if (args.target_box_x is None) ^ (args.target_box_y is None):
+        raise RuntimeError("--target-box-x and --target-box-y must be provided together")
+    if args.target_box_x is not None and args.target_box_y is not None:
+        box_position[0] = float(args.target_box_x)
+        box_position[1] = float(args.target_box_y)
+        panthera_log(
+            f"[Panthera-HT][SingleArm] Target box XY override applied: x={box_position[0]:.4f} y={box_position[1]:.4f}"
+        )
+    if args.target_box_xy_jitter > 0.0:
+        jitter_rng = realism_rng()
+        jitter = jitter_rng.uniform(-args.target_box_xy_jitter, args.target_box_xy_jitter, size=2)
+        box_position[:2] += jitter.astype(np.float32)
+        panthera_log(
+            f"[Panthera-HT][SingleArm] Target box XY jitter applied: "
+            f"dx={float(jitter[0]):.4f} dy={float(jitter[1]):.4f} seed={args.realism_seed}"
+        )
+    box_position[2] = table_height + TARGET_BOX_SIZE[2] / 2.0 + 0.003
     world.scene.add(
         DynamicCuboid(
-            prim_path="/World/Table/TargetCube",
-            name="panthera_target_cube",
-            position=np.array([-0.18, 0.16, table_height + cube_size / 2.0 + 0.003], dtype=np.float32),
-            scale=np.array([cube_size, cube_size, cube_size], dtype=np.float32),
+            prim_path=TARGET_BOX_PRIM_PATH,
+            name="panthera_target_box",
+            position=box_position,
+            scale=TARGET_BOX_SIZE,
             size=1.0,
-            color=np.array([0.05, 0.28, 0.95], dtype=np.float32),
+            color=np.array([0.95, 0.55, 0.08], dtype=np.float32),
         )
     )
 
@@ -680,7 +1073,7 @@ def add_realism_environment(world: World, table_size: float, table_height: float
         bind_material(prim_path, materials[material_name])
 
     bind_material("/World/Table/Top", materials["laminate_table"])
-    for arm_spec in real_layout_arm_specs(table_size, table_height):
+    for arm_spec in selected_layout_arm_specs(table_size, table_height):
         bind_material(arm_spec["mount_path"], materials["brushed_mount"])
     for index in range(1, 5):
         bind_material(f"/World/Table/Leg_{index}", materials["black_rubber"])
@@ -825,87 +1218,93 @@ def real_layout_camera_specs(table_size: float, tabletop_z: float, arm_root_path
     )
     d435i_target = np.array(
         [
-            0.0,
-            d435i_position[1] + REAL_LAYOUT_ARM_EDGE_SIGN * d435i_horizontal_reach,
-            tabletop_z,
+            REAL_LAYOUT_D435I_TARGET_X_OFFSET_M,
+            d435i_position[1] + REAL_LAYOUT_ARM_EDGE_SIGN * d435i_horizontal_reach
+            + REAL_LAYOUT_D435I_TARGET_Y_OFFSET_M,
+            tabletop_z + REAL_LAYOUT_D435I_TARGET_Z_OFFSET_M,
         ],
         dtype=np.float32,
     )
-    return [
-        {
-            "name": "left_wrist_rgb",
-            "prim_path": f"{arm_root_paths['front_left']}/{WRIST_CAMERA_LINK_NAME}/WristRGBCamera",
-            "mode": "wrist",
-            "stream": "rgb",
-            "source_camera": UGREEN_WRIST_CAMERA_REPORT["source_camera"],
-            "intrinsics_status": UGREEN_WRIST_CAMERA_REPORT["intrinsics_status"],
-            "resolution": WRIST_RGB_CAMERA_RESOLUTION,
-            "translation": np.array([0.22, 0.0, 0.075], dtype=np.float32),
-            "target": table_center,
-            "up": np.array([0.0, 0.0, 1.0], dtype=np.float32),
-            "local_forward": np.array([1.0, 0.0, -0.65], dtype=np.float32),
-            "local_up": np.array([0.0, 0.0, 1.0], dtype=np.float32),
-            "intrinsics": None,
-            "focal_length_m": WRIST_RGB_CAMERA_FOCAL_LENGTH_M,
-            "horizontal_aperture_m": horizontal_aperture_for_fov(
-                WRIST_RGB_CAMERA_FOCAL_LENGTH_M, WRIST_RGB_CAMERA_HORIZONTAL_FOV_DEG
-            ),
-        },
-        {
-            "name": "right_wrist_rgb",
-            "prim_path": f"{arm_root_paths['front_right']}/{WRIST_CAMERA_LINK_NAME}/WristRGBCamera",
-            "mode": "wrist",
-            "stream": "rgb",
-            "source_camera": UGREEN_WRIST_CAMERA_REPORT["source_camera"],
-            "intrinsics_status": UGREEN_WRIST_CAMERA_REPORT["intrinsics_status"],
-            "resolution": WRIST_RGB_CAMERA_RESOLUTION,
-            "translation": np.array([0.22, 0.0, 0.075], dtype=np.float32),
-            "target": table_center,
-            "up": np.array([0.0, 0.0, 1.0], dtype=np.float32),
-            "local_forward": np.array([1.0, 0.0, -0.65], dtype=np.float32),
-            "local_up": np.array([0.0, 0.0, 1.0], dtype=np.float32),
-            "intrinsics": None,
-            "focal_length_m": WRIST_RGB_CAMERA_FOCAL_LENGTH_M,
-            "horizontal_aperture_m": horizontal_aperture_for_fov(
-                WRIST_RGB_CAMERA_FOCAL_LENGTH_M, WRIST_RGB_CAMERA_HORIZONTAL_FOV_DEG
-            ),
-        },
-        {
-            "name": "d435i_rgb",
-            "prim_path": "/World/RealSenseD435i/RGBCamera",
-            "mode": "world",
-            "stream": "rgb",
-            "source_camera": D435I_CAMERA_REPORT["source_camera"],
-            "intrinsics_status": "sdk_profile_640x480_at_30fps",
-            "resolution": D435I_RGB_CAMERA_RESOLUTION,
-            "position": d435i_position,
-            "target": d435i_target,
-            "up": np.array([0.0, 0.0, 1.0], dtype=np.float32),
-            "intrinsics": D435I_RGB_INTRINSICS,
-            "focal_length_m": D435I_RGB_INTRINSICS["physical_focal_length_m"],
-            "horizontal_aperture_m": D435I_RGB_INTRINSICS["physical_focal_length_m"]
-            * D435I_RGB_CAMERA_RESOLUTION[0]
-            / D435I_RGB_INTRINSICS["fx"],
-        },
-        {
-            "name": "d435i_depth",
-            "prim_path": "/World/RealSenseD435i/DepthCamera",
-            "mode": "world",
-            "stream": "depth",
-            "source_camera": D435I_CAMERA_REPORT["source_camera"],
-            "intrinsics_status": "sdk_profile_640x480_at_30fps",
-            "resolution": D435I_DEPTH_CAMERA_RESOLUTION,
-            "position": d435i_position,
-            "target": d435i_target,
-            "up": np.array([0.0, 0.0, 1.0], dtype=np.float32),
-            "intrinsics": D435I_DEPTH_INTRINSICS,
-            "depth_intrinsics": D435I_DEPTH_INTRINSICS,
-            "focal_length_m": D435I_DEPTH_INTRINSICS["physical_focal_length_m"],
-            "horizontal_aperture_m": D435I_DEPTH_INTRINSICS["physical_focal_length_m"]
-            * D435I_DEPTH_CAMERA_RESOLUTION[0]
-            / D435I_DEPTH_INTRINSICS["fx"],
-        },
-    ]
+    specs: list[dict[str, object]] = []
+
+    def append_wrist_camera(camera_name: str, arm_label: str) -> None:
+        if arm_label not in arm_root_paths:
+            return
+        side_sign = -1.0 if arm_label == "front_left" else 1.0
+        specs.append(
+            {
+                "name": camera_name,
+                "prim_path": f"{arm_root_paths[arm_label]}/{WRIST_CAMERA_LINK_NAME}/WristRGBCamera",
+                "mode": "wrist",
+                "stream": "rgb",
+                "source_camera": UGREEN_WRIST_CAMERA_REPORT["source_camera"],
+                "intrinsics_status": UGREEN_WRIST_CAMERA_REPORT["intrinsics_status"],
+                "resolution": WRIST_RGB_CAMERA_RESOLUTION,
+                "translation": env_vector3(
+                    "PANTHERA_WRIST_CAMERA_TRANSLATION",
+                    [-0.10, 0.22 * side_sign, 0.18],
+                ),
+                "target": table_center,
+                "up": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+                "local_target": env_vector3(
+                    "PANTHERA_WRIST_CAMERA_LOCAL_TARGET",
+                    [0.18, 0.0, -0.12],
+                ),
+                "local_forward": env_vector3(
+                    "PANTHERA_WRIST_CAMERA_LOCAL_FORWARD",
+                    [1.0, -0.35 * side_sign, -0.65],
+                ),
+                "local_up": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+                "intrinsics": None,
+                "focal_length_m": WRIST_RGB_CAMERA_FOCAL_LENGTH_M,
+                "horizontal_aperture_m": horizontal_aperture_for_fov(
+                    WRIST_RGB_CAMERA_FOCAL_LENGTH_M, WRIST_RGB_CAMERA_HORIZONTAL_FOV_DEG
+                ),
+            }
+        )
+
+    append_wrist_camera("left_wrist_rgb", "front_left")
+    append_wrist_camera("right_wrist_rgb", "front_right")
+    specs.extend(
+        [
+            {
+                "name": "d435i_rgb",
+                "prim_path": "/World/RealSenseD435i/RGBCamera",
+                "mode": "world",
+                "stream": "rgb",
+                "source_camera": D435I_CAMERA_REPORT["source_camera"],
+                "intrinsics_status": "sdk_profile_640x480_at_30fps",
+                "resolution": D435I_RGB_CAMERA_RESOLUTION,
+                "position": d435i_position,
+                "target": d435i_target,
+                "up": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+                "intrinsics": D435I_RGB_INTRINSICS,
+                "focal_length_m": D435I_RGB_INTRINSICS["physical_focal_length_m"],
+                "horizontal_aperture_m": D435I_RGB_INTRINSICS["physical_focal_length_m"]
+                * D435I_RGB_CAMERA_RESOLUTION[0]
+                / D435I_RGB_INTRINSICS["fx"],
+            },
+            {
+                "name": "d435i_depth",
+                "prim_path": "/World/RealSenseD435i/DepthCamera",
+                "mode": "world",
+                "stream": "depth",
+                "source_camera": D435I_CAMERA_REPORT["source_camera"],
+                "intrinsics_status": "sdk_profile_640x480_at_30fps",
+                "resolution": D435I_DEPTH_CAMERA_RESOLUTION,
+                "position": d435i_position,
+                "target": d435i_target,
+                "up": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+                "intrinsics": D435I_DEPTH_INTRINSICS,
+                "depth_intrinsics": D435I_DEPTH_INTRINSICS,
+                "focal_length_m": D435I_DEPTH_INTRINSICS["physical_focal_length_m"],
+                "horizontal_aperture_m": D435I_DEPTH_INTRINSICS["physical_focal_length_m"]
+                * D435I_DEPTH_CAMERA_RESOLUTION[0]
+                / D435I_DEPTH_INTRINSICS["fx"],
+            },
+        ]
+    )
+    return specs
 
 
 def create_layout_cameras(table_size: float, tabletop_z: float, arm_root_paths: dict[str, str]) -> dict[str, Camera]:
@@ -926,11 +1325,22 @@ def create_layout_cameras(table_size: float, tabletop_z: float, arm_root_paths: 
             parent_transform = world_transform_for_prim(parent_path)
             parent_rot = rotation_matrix_from_gf_transform(parent_transform)
             position = world_point_from_prim_local_offset(parent_path, spec["translation"])
-            target = position + (parent_rot @ spec["local_forward"]).astype(np.float32)
+            if "local_target" in spec:
+                target = world_point_from_prim_local_offset(parent_path, spec["local_target"])
+            else:
+                target = position + (parent_rot @ spec["local_forward"]).astype(np.float32)
             orientation = look_at_quat_wxyz(position, target, (parent_rot @ spec["local_up"]).astype(np.float32))
             camera.set_world_pose(position=position, orientation=orientation, camera_axes="world")
             camera._panthera_wrist_parent_path = parent_path
-            focus_distance = 0.35
+            camera._panthera_wrist_target = target
+            focus_distance = float(np.linalg.norm(target - position))
+            print(
+                f"[Panthera-HT] Wrist camera aim {spec['name']}: "
+                f"position={position.tolist()} target={target.tolist()} "
+                f"local_translation={spec['translation'].tolist()} "
+                f"local_forward={spec['local_forward'].tolist()} "
+                f"local_target={spec.get('local_target')}"
+            )
         camera.set_focal_length(spec["focal_length_m"])
         camera.set_horizontal_aperture(spec["horizontal_aperture_m"])
         camera.set_focus_distance(focus_distance)
@@ -1058,9 +1468,9 @@ def create_layout_camera_live_viewports(cameras: dict[str, Camera]) -> list[obje
     for viewport_index, camera_name in enumerate(LIVE_LAYOUT_CAMERA_VIEWPORT_NAMES):
         camera = cameras.get(camera_name)
         if camera is None:
-            raise RuntimeError(f"Requested live layout camera viewport is missing camera: {camera_name}")
-        position_x = 20 + (viewport_width + 40) * (viewport_index % 2)
-        position_y = 40 + (viewport_height + 60) * (viewport_index // 2)
+            continue
+        position_x = 20 + (viewport_width + 40) * (len(windows) % 2)
+        position_y = 40 + (viewport_height + 60) * (len(windows) // 2)
         try:
             window = create_viewport_for_camera(
                 viewport_name=f"Panthera {camera_name}",
@@ -1439,6 +1849,132 @@ def world_position_for_prim(prim_path: str) -> np.ndarray:
     return np.array([origin[0], origin[1], origin[2]], dtype=np.float64)
 
 
+def safe_world_position_for_prim(prim_path: str) -> np.ndarray | None:
+    stage = omni.usd.get_context().get_stage()
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return None
+    try:
+        return world_position_for_prim(prim_path)
+    except Exception as exc:
+        panthera_log(f"[Panthera-HT][SingleArm][Metrics] Unable to read prim position {prim_path}: {exc}")
+        return None
+
+
+def rollout_metrics_dir(rollout_id: str) -> Path:
+    safe_id = rollout_id or time.strftime("single_arm_%Y%m%d_%H%M%S")
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", safe_id).strip("_") or "single_arm_rollout"
+    output_dir = repo_root() / "outputs/panthera_ht/single_arm_rollouts" / safe_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def active_arm_root_path(arms: list[dict[str, object]], active_arm_label: str) -> str:
+    for arm in arms:
+        if str(arm["label"]) == active_arm_label:
+            return str(arm["root_path"])
+    raise RuntimeError(f"Active arm {active_arm_label} was not imported; available={[arm['label'] for arm in arms]}")
+
+
+def single_arm_metrics_snapshot(
+    cube_initial_pos: np.ndarray | None,
+    active_arm_root: str,
+    tabletop_z: float,
+) -> dict[str, object]:
+    cube_pos = safe_world_position_for_prim(TARGET_BOX_PRIM_PATH)
+    wrist_pos = safe_world_position_for_prim(f"{active_arm_root}/{WRIST_CAMERA_LINK_NAME}")
+    cube_displacement_m = None
+    cube_xy_displacement_m = None
+    ee_to_cube_distance_m = None
+    object_on_table = None
+    object_height_margin_m = None
+    if cube_pos is not None and cube_initial_pos is not None:
+        delta = cube_pos - cube_initial_pos
+        cube_displacement_m = float(np.linalg.norm(delta))
+        cube_xy_displacement_m = float(np.linalg.norm(delta[:2]))
+        object_height_margin_m = float(cube_pos[2] - (tabletop_z + TARGET_BOX_SIZE[2] / 2.0))
+        object_on_table = bool(
+            abs(cube_pos[0]) <= args.table_size / 2.0
+            and abs(cube_pos[1]) <= args.table_size / 2.0
+            and cube_pos[2] <= tabletop_z + TARGET_BOX_SIZE[2] / 2.0 + 0.03
+        )
+    if cube_pos is not None and wrist_pos is not None:
+        ee_to_cube_distance_m = float(np.linalg.norm(wrist_pos - cube_pos))
+    return {
+        "target_box_path": TARGET_BOX_PRIM_PATH,
+        "cube_initial_pos": None if cube_initial_pos is None else cube_initial_pos.tolist(),
+        "cube_current_pos": None if cube_pos is None else cube_pos.tolist(),
+        "wrist_current_pos": None if wrist_pos is None else wrist_pos.tolist(),
+        "cube_displacement_m": cube_displacement_m,
+        "cube_xy_displacement_m": cube_xy_displacement_m,
+        "ee_to_cube_distance_m": ee_to_cube_distance_m,
+        "object_on_table": object_on_table,
+        "object_height_margin_m": object_height_margin_m,
+    }
+
+
+def single_arm_proxy_success(snapshot: dict[str, object]) -> bool:
+    object_on_table = bool(snapshot.get("object_on_table"))
+    if args.success_metric in {"proxy-box-displacement", "proxy-cube-displacement"}:
+        displacement = snapshot.get("cube_xy_displacement_m")
+        return bool(object_on_table and displacement is not None and float(displacement) >= args.success_displacement_threshold)
+    if args.success_metric == "ee-to-box":
+        distance = snapshot.get("ee_to_cube_distance_m")
+        return bool(object_on_table and distance is not None and float(distance) <= args.success_distance_threshold)
+    return False
+
+
+def write_single_arm_metrics(
+    rollout_id: str,
+    active_arm_label: str,
+    active_arm_root: str,
+    frames: int,
+    exit_reason: str,
+    cube_initial_pos: np.ndarray | None,
+    tabletop_z: float,
+    policy_inference_count: int,
+    policy_apply_count: int,
+    last_policy_action7: list[float] | None,
+    replay_summary: dict[str, object] | None = None,
+) -> Path:
+    snapshot = single_arm_metrics_snapshot(cube_initial_pos, active_arm_root, tabletop_z)
+    proxy_success = single_arm_proxy_success(snapshot)
+    output_dir = rollout_metrics_dir(rollout_id)
+    payload = {
+        "rollout_id": output_dir.name,
+        "arm_layout": args.arm_layout,
+        "active_arm_label": active_arm_label,
+        "active_arm_root": active_arm_root,
+        "task": "push the object on the table",
+        "success_metric": args.success_metric,
+        "success_displacement_threshold_m": args.success_displacement_threshold,
+        "success_distance_threshold_m": args.success_distance_threshold,
+        "target_box_xy_jitter_m": args.target_box_xy_jitter,
+        "realism_seed": args.realism_seed,
+        "frames": int(frames),
+        "max_frames": int(args.max_frames),
+        "exit_reason": exit_reason,
+        "control_source": "dataset_replay" if replay_summary else "smolvla_or_scripted",
+        "policy_inference_count": int(policy_inference_count),
+        "policy_apply_count": int(policy_apply_count),
+        "last_policy_action7": last_policy_action7,
+        "proxy_success": proxy_success,
+        **snapshot,
+    }
+    if replay_summary:
+        payload.update(json_ready(replay_summary))
+    metrics_path = output_dir / "metrics.json"
+    write_json(metrics_path, payload)
+    panthera_log(
+        f"[Panthera-HT][SingleArm][Metrics] rollout_id={output_dir.name} arm={active_arm_label} "
+        f"frames={frames} policy_inferences={policy_inference_count} policy_applies={policy_apply_count} "
+        f"cube_xy_displacement_m={snapshot.get('cube_xy_displacement_m')} "
+        f"ee_to_cube_distance_m={snapshot.get('ee_to_cube_distance_m')} proxy_success={str(proxy_success).lower()} "
+        f"metrics_path={metrics_path}"
+    )
+    return metrics_path
+
+
 def print_layout_arm_reach_evidence(arms: list[dict[str, object]], frame_label: str) -> None:
     for arm in arms:
         root_path = str(arm["root_path"])
@@ -1503,7 +2039,7 @@ def should_keep_running() -> bool:
 
 def import_layout_arms(source_urdf_path: Path, mesh_dir: Path, tabletop_z: float) -> list[dict[str, object]]:
     arms = []
-    for arm_spec in real_layout_arm_specs(args.table_size, tabletop_z):
+    for arm_spec in selected_layout_arm_specs(args.table_size, tabletop_z):
         urdf_path = prepare_panthera_urdf_for_isaac(source_urdf_path, mesh_dir, arm_spec["urdf_robot_name"])
         articulation_path = import_panthera_to_stage(urdf_path, arm_spec["stage_root_path"])
         root_path = imported_robot_root_path(articulation_path)
@@ -1591,6 +2127,16 @@ def main() -> None:
         print(f"[Panthera-HT] {arm['label']} DOF names: {panthera.dof_names}")
         carb.log_info(f"Panthera-HT {arm['label']} dof names: {panthera.dof_names}")
 
+    pantheras_by_label = {str(arm['label']): panthera for arm, panthera in zip(arms, pantheras)}
+    active_arm_label = canonical_active_arm_label()
+    active_panthera = pantheras_by_label.get(active_arm_label)
+    if active_panthera is None:
+        raise RuntimeError(f"Active arm {active_arm_label} is not available in imported arms: {list(pantheras_by_label)}")
+    active_arm_root = active_arm_root_path(arms, active_arm_label)
+    if args.arm_layout.startswith("single-"):
+        print(f"[Panthera-HT] Single-arm scene active: arm_label={active_arm_label} arms={len(arms)}")
+        carb.log_info(f"Panthera-HT single-arm scene active: arm_label={active_arm_label} arms={len(arms)}")
+
     for panthera in pantheras:
         panthera.set_joint_positions(pose_for_dofs(panthera.dof_names, 0, args.no_motion))
     world.step(render=True)
@@ -1612,9 +2158,22 @@ def main() -> None:
                 f"{', '.join(LIVE_LAYOUT_CAMERA_VIEWPORT_NAMES)}"
             )
         carb.log_info(f"Panthera-HT layout cameras ready: {list(layout_cameras.keys())}")
+    if args.enable_smolvla_policy:
+        if not layout_cameras:
+            raise RuntimeError("SmolVLA policy requires layout cameras to be enabled")
+        if not args.smolvla_model_id:
+            raise RuntimeError("--enable-smolvla-policy requires --smolvla-model-id or PANTHERA_SMOLVLA_MODEL_ID")
+        control_mode_summary = args.smolvla_control_mode
+        if args.smolvla_control_mode == "single-arm":
+            control_mode_summary = f"single-arm[{active_arm_label}]"
+        panthera_log(
+            f"[Panthera-HT][SmolVLA] Control mode {control_mode_summary}: "
+            "log-only keeps scripted motion active; single-arm applies 7D action to active arm only; "
+            "front-left projects 7D action to front_left only; mirror-both projects the same 7D action to both arms"
+        )
     print(
         "[Panthera-HT] Running real-layout scene: "
-        f"headless={args.headless}, max_frames={args.max_frames}, arms={len(pantheras)}, "
+        f"headless={args.headless}, max_frames={args.max_frames}, arms={len(arms)}, "
         f"table_size={args.table_size}m. "
         "Close Isaac Sim or press Ctrl+C to stop; use --max-frames N for finite headless runs."
     )
@@ -1624,7 +2183,87 @@ def main() -> None:
         f"PANTHERA_MAX_FRAMES={os.getenv('PANTHERA_MAX_FRAMES', '')!r}"
     )
 
-    if layout_cameras and not args.skip_layout_screenshots:
+    cube_initial_pos = safe_world_position_for_prim(TARGET_BOX_PRIM_PATH)
+    policy_inference_count = 0
+    policy_apply_count = 0
+    replay_apply_count = 0
+    replay_summary: dict[str, object] | None = None
+    replay_actions: dict[str, object] | None = None
+    replay_min_ee_to_cube_distance_m: float | None = None
+    replay_initial_ee_to_cube_distance_m: float | None = None
+    replay_max_joint_target_abs_error: float | None = None
+    replay_mean_joint_target_abs_error_sum = 0.0
+    replay_joint_error_samples = 0
+    replay_last_action7: list[float] | None = None
+    replay_last_target_error: dict[str, object] | None = None
+    replay_last_index: int | None = None
+    aligned_initial_state7: list[float] | None = None
+    if args.enable_dataset_action_replay:
+        if args.enable_smolvla_policy:
+            raise RuntimeError("Dataset action replay is mutually exclusive with --enable-smolvla-policy")
+        if not args.arm_layout.startswith("single-"):
+            raise RuntimeError("Dataset action replay requires --arm-layout single-front-left or single-front-right")
+        replay_actions = load_dataset_replay_actions(args.dataset_action_replay_path)
+        if args.dataset_action_replay_align_initial_state:
+            aligned_initial_state7 = first_replay_state7(replay_actions)
+            if aligned_initial_state7 is None:
+                raise RuntimeError("Dataset action replay initial-state alignment requested, but replay file has no state7")
+            active_panthera.set_joint_positions(replay_action_target_for_dofs(active_panthera.dof_names, aligned_initial_state7))
+            world.step(render=True)
+            panthera_log(
+                f"[Panthera-HT][Replay] Initial state alignment applied from episode0 state7="
+                f"{aligned_initial_state7} arm={active_arm_label}"
+            )
+        replay_snapshot = single_arm_metrics_snapshot(cube_initial_pos, active_arm_root, tabletop_z)
+        replay_initial_ee_to_cube_distance_m = replay_snapshot.get("ee_to_cube_distance_m")
+        replay_min_ee_to_cube_distance_m = replay_initial_ee_to_cube_distance_m
+        replay_summary = {
+            "replay_enabled": True,
+            "replay_action_path": relative_to_repo(replay_actions["path"]),
+            "replay_action_format": replay_actions["payload"].get("format"),
+            "replay_action_count": len(replay_actions["actions"]),
+            "replay_actions_applied": 0,
+            "replay_start_index": int(args.dataset_action_replay_start_index),
+            "replay_stride": int(args.dataset_action_replay_stride),
+            "replay_hold_last_action": bool(args.dataset_action_replay_hold_last),
+            "replay_align_initial_state": bool(args.dataset_action_replay_align_initial_state),
+            "dataset_task": replay_actions["payload"].get("task"),
+            "dataset_episode_index": replay_actions["payload"].get("episode_index"),
+            "dataset_fps": replay_actions["payload"].get("fps"),
+            "replay_initial_state7": aligned_initial_state7,
+            "first_replay_action7": replay_actions.get("first_action7"),
+            "expected_last_replay_action7": replay_actions.get("last_action7"),
+            "min_replay_action7": replay_actions.get("min_action7"),
+            "max_replay_action7": replay_actions.get("max_action7"),
+            "mean_replay_action7": replay_actions.get("mean_action7"),
+            "gripper_clip_count": replay_actions.get("gripper_clip_count"),
+            "initial_ee_to_cube_distance_m": replay_initial_ee_to_cube_distance_m,
+            "min_ee_to_cube_distance_m": replay_min_ee_to_cube_distance_m,
+            "final_ee_to_cube_distance_m": None,
+            "max_joint_target_abs_error": None,
+            "mean_joint_target_abs_error": None,
+            "last_joint_target_abs_error": None,
+            "last_replay_index": None,
+            "last_replay_action7": None,
+        }
+        panthera_log(
+            f"[Panthera-HT][Replay] Enabled dataset-action replay path={replay_summary['replay_action_path']} "
+            f"active_arm={active_arm_label} arm_layout={args.arm_layout} action_count={replay_summary['replay_action_count']} "
+            f"fps={replay_summary['dataset_fps']} episode={replay_summary['dataset_episode_index']} "
+            f"task={replay_summary['dataset_task']!r} smolvla_inference_disabled=true scripted_fallback_disabled=true"
+        )
+        panthera_log(
+            f"[Panthera-HT][Replay] Source validation action_shape=[{replay_summary['replay_action_count']}, 7] "
+            f"first_action7={replay_summary['first_replay_action7']} last_action7={replay_summary['expected_last_replay_action7']} "
+            f"first_state7={replay_actions['payload'].get('first_state7')}"
+        )
+
+    if args.enable_dataset_action_replay and layout_cameras and not args.skip_layout_screenshots:
+        panthera_log(
+            "[Panthera-HT][Replay] Skipping scripted layout screenshot/motion proof during dataset replay "
+            "to preserve replay-aligned initial joints."
+        )
+    if layout_cameras and not args.skip_layout_screenshots and not args.enable_dataset_action_replay:
         sequence_frames = parse_layout_sequence_frames(args.layout_sequence_frames)
         for _ in range(LAYOUT_CAMERA_CAPTURE_WARMUP_FRAMES):
             world.step(render=True)
@@ -1662,6 +2301,43 @@ def main() -> None:
     reset_needed = False
     frame_index = 0
     exit_reason = "simulation_app requested exit"
+    smolvla_infer_interval = max(1, int(args.smolvla_infer_interval)) if args.enable_smolvla_policy else 0
+    last_policy_action7 = None
+    policy_hold_apply_count = 0
+
+    if args.enable_smolvla_policy:
+        for _ in range(LAYOUT_CAMERA_CAPTURE_WARMUP_FRAMES):
+            world.step(render=True)
+        warmup_action7 = run_smolvla_policy_inference(frame_index, active_panthera, layout_cameras, active_arm_label)
+        policy_inference_count += 1
+        last_policy_action7 = warmup_action7
+        if args.smolvla_control_mode in {"front-left", "single-arm"}:
+            active_panthera.set_joint_positions(
+                smolvla_policy_target_for_dofs(active_panthera.dof_names, warmup_action7)
+            )
+            policy_apply_count += 1
+            panthera_log(
+                f"[Panthera-HT][SmolVLA] Applied single-arm policy target: arm={active_arm_label} "
+                f"joint1..joint6={warmup_action7[:6]} gripper={warmup_action7[6]}"
+            )
+        elif args.smolvla_control_mode == "mirror-both":
+            front_left_panthera = pantheras_by_label.get("front_left")
+            front_right_panthera = pantheras_by_label.get("front_right")
+            if front_left_panthera is not None:
+                front_left_panthera.set_joint_positions(
+                    smolvla_policy_target_for_dofs(front_left_panthera.dof_names, warmup_action7)
+                )
+            if front_right_panthera is not None:
+                front_right_panthera.set_joint_positions(
+                    smolvla_policy_target_for_dofs(front_right_panthera.dof_names, warmup_action7)
+                )
+            policy_apply_count += 1
+            panthera_log("[Panthera-HT][SmolVLA] Applied mirror-both experimental policy target: action7 projected to both arms")
+        else:
+            panthera_log(
+                "[Panthera-HT][SmolVLA] Control mode log-only: predicted action not applied; scripted motion remains active"
+            )
+        frame_index = 1
 
     try:
         while should_keep_running():
@@ -1670,14 +2346,112 @@ def main() -> None:
             if world.is_stopped() and not reset_needed:
                 reset_needed = True
 
-            if world.is_playing():
+            effective_playing = world.is_playing() or (args.headless and args.max_frames > 0)
+            if effective_playing:
                 if reset_needed:
                     world.reset()
                     reset_needed = False
                     frame_index = 0
+                    last_policy_action7 = None
+                    policy_hold_apply_count = 0
+                    cube_initial_pos = safe_world_position_for_prim(TARGET_BOX_PRIM_PATH)
+                    if replay_summary:
+                        replay_apply_count = 0
+                        replay_min_ee_to_cube_distance_m = None
+                        replay_initial_ee_to_cube_distance_m = None
+                        replay_max_joint_target_abs_error = None
+                        replay_mean_joint_target_abs_error_sum = 0.0
+                        replay_joint_error_samples = 0
+                        replay_last_action7 = None
+                        replay_last_target_error = None
+                        replay_last_index = None
 
-                for panthera in pantheras:
-                    panthera.set_joint_positions(pose_for_dofs(panthera.dof_names, frame_index, args.no_motion))
+                if replay_actions is not None:
+                    replay_item = replay_action_for_frame(replay_actions, frame_index)
+                    if replay_item is None:
+                        exit_reason = f"dataset replay exhausted at frame {frame_index}"
+                        break
+                    replay_index, replay_action7 = replay_item
+                    replay_target = replay_action_target_for_dofs(active_panthera.dof_names, replay_action7)
+                    active_panthera.set_joint_positions(replay_target)
+                    replay_apply_count += 1
+                    replay_last_index = replay_index
+                    replay_last_action7 = replay_action7
+                    replay_last_target_error = joint_abs_error_for_target(active_panthera, replay_target)
+                    max_error = replay_last_target_error.get("max_abs_error")
+                    mean_error = replay_last_target_error.get("mean_abs_error")
+                    if max_error is not None:
+                        replay_max_joint_target_abs_error = max(
+                            replay_max_joint_target_abs_error or 0.0, float(max_error)
+                        )
+                    if mean_error is not None:
+                        replay_mean_joint_target_abs_error_sum += float(mean_error)
+                        replay_joint_error_samples += 1
+                    replay_snapshot = single_arm_metrics_snapshot(cube_initial_pos, active_arm_root, tabletop_z)
+                    ee_distance = replay_snapshot.get("ee_to_cube_distance_m")
+                    if ee_distance is not None:
+                        replay_min_ee_to_cube_distance_m = (
+                            float(ee_distance)
+                            if replay_min_ee_to_cube_distance_m is None
+                            else min(replay_min_ee_to_cube_distance_m, float(ee_distance))
+                        )
+                    if frame_index == 0 or frame_index % 30 == 0 or frame_index + 1 >= args.max_frames:
+                        panthera_log(
+                            f"[Panthera-HT][Replay] Applied dataset action frame={frame_index} replay_index={replay_index} "
+                            f"action7={replay_action7} target_joint_positions={json_ready(replay_target)} "
+                            f"actual_joint_positions={actual_joint_positions_by_name(active_panthera)} "
+                            f"joint_target_error={replay_last_target_error} "
+                            f"ee_to_cube_distance_m={ee_distance} cube_xy_displacement_m={replay_snapshot.get('cube_xy_displacement_m')}"
+                        )
+                    frame_index += 1
+                    if args.max_frames > 0 and frame_index >= args.max_frames:
+                        exit_reason = f"max_frames reached ({args.max_frames})"
+                        break
+                    continue
+
+                policy_action7 = None
+                if args.enable_smolvla_policy and smolvla_infer_interval > 0 and frame_index % smolvla_infer_interval == 0:
+                    policy_action7 = run_smolvla_policy_inference(frame_index, active_panthera, layout_cameras, active_arm_label)
+                    policy_inference_count += 1
+                    last_policy_action7 = policy_action7
+
+                if policy_action7 is not None and args.smolvla_control_mode in {"front-left", "single-arm"}:
+                    active_panthera.set_joint_positions(
+                        smolvla_policy_target_for_dofs(active_panthera.dof_names, policy_action7)
+                    )
+                    policy_apply_count += 1
+                    panthera_log(
+                        f"[Panthera-HT][SmolVLA] Applied single-arm policy target: arm={active_arm_label} "
+                        f"joint1..joint6={policy_action7[:6]} gripper={policy_action7[6]}"
+                    )
+                elif policy_action7 is not None and args.smolvla_control_mode == "mirror-both":
+                    front_left_panthera = pantheras_by_label.get("front_left")
+                    front_right_panthera = pantheras_by_label.get("front_right")
+                    if front_left_panthera is not None:
+                        front_left_panthera.set_joint_positions(
+                            smolvla_policy_target_for_dofs(front_left_panthera.dof_names, policy_action7)
+                        )
+                    if front_right_panthera is not None:
+                        front_right_panthera.set_joint_positions(
+                            smolvla_policy_target_for_dofs(front_right_panthera.dof_names, policy_action7)
+                        )
+                    policy_apply_count += 1
+                    panthera_log(
+                        f"[Panthera-HT][SmolVLA] Applied mirror-both experimental policy target: action7 projected to both arms"
+                    )
+                elif args.smolvla_control_mode in {"front-left", "single-arm"} and last_policy_action7 is not None:
+                    active_panthera.set_joint_positions(
+                        smolvla_policy_target_for_dofs(active_panthera.dof_names, last_policy_action7)
+                    )
+                    policy_hold_apply_count += 1
+                else:
+                    for panthera in pantheras:
+                        panthera.set_joint_positions(pose_for_dofs(panthera.dof_names, frame_index, args.no_motion))
+                    if policy_action7 is not None and args.smolvla_control_mode == "log-only":
+                        panthera_log(
+                            "[Panthera-HT][SmolVLA] Control mode log-only: predicted action not applied; scripted motion remains active"
+                        )
+
                 frame_index += 1
 
                 if args.max_frames > 0 and frame_index >= args.max_frames:
@@ -1689,6 +2463,51 @@ def main() -> None:
     except KeyboardInterrupt:
         exit_reason = "keyboard interrupt"
     finally:
+        if replay_summary is not None:
+            final_snapshot = single_arm_metrics_snapshot(cube_initial_pos, active_arm_root, tabletop_z)
+            final_ee = final_snapshot.get("ee_to_cube_distance_m")
+            replay_summary.update(
+                {
+                    "replay_actions_applied": int(replay_apply_count),
+                    "policy_inference_count": int(policy_inference_count),
+                    "policy_apply_count": int(policy_apply_count + policy_hold_apply_count),
+                    "initial_ee_to_cube_distance_m": replay_initial_ee_to_cube_distance_m,
+                    "min_ee_to_cube_distance_m": replay_min_ee_to_cube_distance_m,
+                    "final_ee_to_cube_distance_m": final_ee,
+                    "max_joint_target_abs_error": replay_max_joint_target_abs_error,
+                    "mean_joint_target_abs_error": (
+                        replay_mean_joint_target_abs_error_sum / replay_joint_error_samples
+                        if replay_joint_error_samples
+                        else None
+                    ),
+                    "last_joint_target_abs_error": replay_last_target_error,
+                    "last_replay_index": replay_last_index,
+                    "last_replay_action7": replay_last_action7,
+                    "target_box_initial_pos": cube_initial_pos,
+                    "target_box_size_m": TARGET_BOX_SIZE,
+                }
+            )
+            proxy_success = single_arm_proxy_success(final_snapshot)
+            panthera_log(
+                f"[Panthera-HT][Replay] Complete frames={frame_index} replay_actions_loaded={replay_summary.get('replay_action_count')} "
+                f"replay_actions_applied={replay_apply_count} exit_reason={exit_reason!r} proxy_success={str(proxy_success).lower()} "
+                f"min_ee_to_cube_distance_m={replay_summary.get('min_ee_to_cube_distance_m')} "
+                f"final_ee_to_cube_distance_m={final_ee} cube_xy_displacement_m={final_snapshot.get('cube_xy_displacement_m')}"
+            )
+        if args.enable_single_arm_metrics:
+            write_single_arm_metrics(
+                rollout_id=args.rollout_id,
+                active_arm_label=active_arm_label,
+                active_arm_root=active_arm_root,
+                frames=frame_index,
+                exit_reason=exit_reason,
+                cube_initial_pos=cube_initial_pos,
+                tabletop_z=tabletop_z,
+                policy_inference_count=policy_inference_count,
+                policy_apply_count=policy_apply_count + policy_hold_apply_count,
+                last_policy_action7=last_policy_action7,
+                replay_summary=replay_summary,
+            )
         print(f"[Panthera-HT] Scene exiting: {exit_reason}")
         carb.log_info(f"Panthera-HT scene exiting: {exit_reason}")
         omni.timeline.get_timeline_interface().stop()
