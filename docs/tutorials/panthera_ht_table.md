@@ -35,11 +35,11 @@ Realism mode is enabled by default to reduce visual sim-to-real gap for VLA expe
 
 ## Layout Cameras and VLA Export
 
-The scene creates layout cameras that match the current real-world setup: `left_wrist_rgb` and `right_wrist_rgb` are wrist-mounted under each arm's `link6`, while `d435i_rgb` and `d435i_depth` model the Intel RealSense D435i mounted at the opposite table edge. D435i RGB/depth intrinsics are recorded from the supplied `640x480@30` profile. The UGREEN wrist cameras are intentionally marked approximate/uncalibrated because the real UVC camera does not expose `fx/fy/cx/cy/distortion`.
+The scene creates layout cameras that match the current real-world setup: `left_wrist_rgb` and `right_wrist_rgb` are wrist-mounted under each arm's `link6` using the measured UGREEN hand-eye extrinsics converted to USD camera axes, with `Horizontal aperture` fixed at `0.9`, while `d435i_rgb` and `d435i_depth` model the Intel RealSense D435i mounted at the midpoint of the opposite table edge, 60 cm above the tabletop, with USD Camera orientation fixed at `X=-27`, `Y=0`, `Z=180` degrees. D435i RGB/depth intrinsics are recorded from the supplied `640x480@30` profile. The UGREEN wrist camera intrinsics are still approximate/uncalibrated because the real UVC camera does not expose `fx/fy/cx/cy/distortion`.
 
 Startup and after-motion PNG checks are written to `outputs/panthera_ht/layout_cameras/`. A synchronized VLA-style sequence is written to `outputs/panthera_ht/layout_cameras/sequence/`, with per-frame RGB PNGs, D435i distance-to-image-plane `.npy` arrays, frame metadata, camera poses, joint targets, and an `episode_manifest.json`.
 
-In non-headless GUI mode, the one-click launcher opens continuously updating live viewport windows for `left_wrist_rgb`, `right_wrist_rgb`, and `d435i_rgb`. Use `--disable-layout-cameras` to skip camera creation, `--skip-layout-screenshots` to keep cameras but skip PNG/sequence export, or `--disable-layout-camera-viewports` to keep GUI mode without live camera viewport windows.
+In non-headless GUI mode, live camera viewport windows are disabled by default to avoid extra X11/GLFW window churn on unstable display stacks. Use `--show-layout-camera-viewports` or `PANTHERA_SHOW_LAYOUT_CAMERA_VIEWPORTS=1` to open continuously updating live viewport windows for `left_wrist_rgb`, `right_wrist_rgb`, and `d435i_rgb`. Use `--disable-layout-cameras` to skip camera creation, `--skip-layout-screenshots` to keep cameras but skip PNG/sequence export, or `--disable-layout-camera-viewports` to force GUI mode without live camera viewport windows.
 
 ## Run
 

@@ -16,6 +16,23 @@ from pathlib import Path
 from isaacsim import SimulationApp
 
 
+NO_RENDERING_EXTENSIONS = [
+    "omni.physx",
+    "omni.physx.tensors",
+    "omni.physx.fabric",
+    "omni.warp.core",
+    "usdrt.scenegraph",
+    "omni.kit.telemetry",
+    "omni.kit.loop",
+    "omni.kit.usd.mdl",
+    "omni.usd.metrics.assembler.ui",
+    "isaacsim.core.api",
+    "isaacsim.core.prims",
+    "isaacsim.core.utils",
+    "isaacsim.asset.importer.urdf",
+]
+
+
 def env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -61,6 +78,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headless", action="store_true", default=env_flag("PANTHERA_HEADLESS"))
     parser.add_argument("--max-frames", type=int, default=env_int("PANTHERA_MAX_FRAMES"))
     parser.add_argument("--no-motion", action="store_true", default=env_flag("PANTHERA_NO_MOTION"))
+    parser.add_argument(
+        "--no-rendering",
+        action="store_true",
+        default=env_flag("PANTHERA_NO_RENDERING"),
+        help="Start Isaac Sim with the physics-only no-rendering experience for headless smoke validation.",
+    )
+    parser.add_argument(
+        "--renderer",
+        default=os.getenv("PANTHERA_RENDERER", "RaytracedLighting"),
+        help="Renderer used for the normal Isaac Sim experience.",
+    )
+    parser.add_argument(
+        "--disable-viewport-updates",
+        action="store_true",
+        default=env_flag("PANTHERA_DISABLE_VIEWPORT_UPDATES"),
+        help="Disable viewport updates while keeping the normal rendering experience.",
+    )
     parser.add_argument(
         "--arm-layout",
         choices=("dual", "single-front-left", "single-front-right"),
@@ -190,7 +224,7 @@ def parse_args() -> argparse.Namespace:
         "--show-layout-camera-viewports",
         dest="show_layout_camera_viewports",
         action="store_true",
-        default=env_flag("PANTHERA_SHOW_LAYOUT_CAMERA_VIEWPORTS", True),
+        default=env_flag("PANTHERA_SHOW_LAYOUT_CAMERA_VIEWPORTS", False),
         help="Open live Isaac viewport windows for the wrist and D435i layout cameras in non-headless mode.",
     )
     parser.add_argument(
@@ -205,8 +239,36 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def build_simulation_app(parsed_args: argparse.Namespace) -> SimulationApp:
+    if parsed_args.no_rendering:
+        if parsed_args.enable_smolvla_policy:
+            raise RuntimeError("--enable-smolvla-policy requires rendered layout cameras; disable --no-rendering.")
+        parsed_args.headless = True
+        parsed_args.disable_layout_cameras = True
+        parsed_args.skip_layout_screenshots = True
+        parsed_args.show_layout_camera_viewports = False
+        parsed_args.disable_viewport_updates = True
+        extra_args = []
+        extra_args.extend(["--/persistent/renderer/startupMessageDisplayed=1"])
+        for extension in NO_RENDERING_EXTENSIONS:
+            extra_args.extend(["--enable", extension])
+        return SimulationApp(
+            {"headless": True, "extra_args": extra_args, "disable_viewport_updates": True},
+            experience=None,
+        )
+
+    return SimulationApp(
+        {
+            "headless": parsed_args.headless,
+            "renderer": parsed_args.renderer,
+            "disable_viewport_updates": parsed_args.disable_viewport_updates,
+        }
+    )
+
+
 args = parse_args()
-simulation_app = SimulationApp({"headless": args.headless, "renderer": "RaytracedLighting"})
+simulation_app = build_simulation_app(args)
+render_enabled = not args.no_rendering
 _reported_is_running_false = False
 
 import carb
@@ -216,10 +278,8 @@ import omni.kit.commands
 import omni.timeline
 import omni.usd
 from isaacsim.core.api import World
-from isaacsim.core.api.objects import DynamicCuboid, FixedCuboid
+from isaacsim.core.api.objects import DynamicCuboid, FixedCuboid, GroundPlane
 from isaacsim.core.prims import Articulation, XFormPrim
-from isaacsim.core.utils.viewports import create_viewport_for_camera, set_camera_view
-from isaacsim.sensors.camera import Camera
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdShade
 
 
@@ -249,15 +309,28 @@ REAL_LAYOUT_ARM_CORNER_INSET = 0.09
 REAL_LAYOUT_ROBOT_BASE_Z_OFFSET = 0.025
 REAL_LAYOUT_ROBOT_YAW_DEG = 90.0
 REAL_LAYOUT_D435I_HEIGHT_ABOVE_TABLE = 0.60
-REAL_LAYOUT_D435I_DOWNWARD_ANGLE_DEG = 45.0
-REAL_LAYOUT_D435I_TARGET_X_OFFSET_M = -0.22
-REAL_LAYOUT_D435I_TARGET_Y_OFFSET_M = 0.02
+REAL_LAYOUT_D435I_ORIENTATION_X_DEG = -27.0
+REAL_LAYOUT_D435I_ORIENTATION_Z_DEG = 180.0
+REAL_LAYOUT_D435I_DOWNWARD_ANGLE_DEG = 90.0 + REAL_LAYOUT_D435I_ORIENTATION_X_DEG
+REAL_LAYOUT_D435I_TARGET_X_OFFSET_M = 0.0
+REAL_LAYOUT_D435I_TARGET_Y_OFFSET_M = 0.0
 REAL_LAYOUT_D435I_TARGET_Z_OFFSET_M = 0.12
 WRIST_CAMERA_LINK_NAME = "link6"
 LAYOUT_CAMERA_CAPTURE_WARMUP_FRAMES = 24
 WRIST_RGB_CAMERA_RESOLUTION = (640, 480)
 WRIST_RGB_CAMERA_FOCAL_LENGTH_M = 0.0028
 WRIST_RGB_CAMERA_HORIZONTAL_FOV_DEG = 85.0
+WRIST_RGB_CAMERA_HORIZONTAL_APERTURE_M = 0.9
+WRIST_RGB_CAMERA_FOCUS_DISTANCE_M = 0.50
+UGREEN_WRIST_HAND_EYE_SOURCE = "arm1_ugreen_handeye_calibration.json:T_cam2gripper"
+UGREEN_WRIST_LINK6_TO_CAMERA_TRANSLATION_M = np.array(
+    [0.060855823, 0.004961183, 0.090055562],
+    dtype=np.float32,
+)
+UGREEN_WRIST_LINK6_TO_USD_CAMERA_QUAT_WXYZ = np.array(
+    [0.656442067, 0.265649344, -0.276286813, -0.649753673],
+    dtype=np.float32,
+)
 D435I_RGB_CAMERA_RESOLUTION = (640, 480)
 D435I_DEPTH_CAMERA_RESOLUTION = (640, 480)
 LAYOUT_CAMERA_MOTION_PROOF_FRAME = 180
@@ -289,7 +362,13 @@ UGREEN_WRIST_CAMERA_REPORT = {
     "stable_node": "/dev/v4l/by-id/usb-UGREEN_Camera_1080P_UGREEN_Camera_1080P_SN0001-video-index0",
     "sim_profile": "MJPG 640x480@30",
     "intrinsics_status": "approximate_uncalibrated",
-    "calibration_note": "V4L2 does not expose fx/fy/cx/cy/distortion; run OpenCV/ROS calibration for 1:1 geometry.",
+    "extrinsics_status": "hand_eye_calibrated_link6_to_usd_camera",
+    "hand_eye_source": UGREEN_WRIST_HAND_EYE_SOURCE,
+    "calibration_note": (
+        "Wrist extrinsics use the measured link6-to-camera hand-eye result converted from OpenCV/ROS optical "
+        "axes to USD camera axes. Intrinsics remain approximate because V4L2 does not expose "
+        "fx/fy/cx/cy/distortion."
+    ),
 }
 D435I_CAMERA_REPORT = {
     "source_camera": "Intel RealSense D435i",
@@ -1084,6 +1163,29 @@ def quat_wxyz_from_yaw_deg(yaw_deg: float) -> np.ndarray:
     return np.array([math.cos(half), 0.0, 0.0, math.sin(half)], dtype=np.float32)
 
 
+def quat_wxyz_from_x_rotation_deg(x_deg: float) -> np.ndarray:
+    half = math.radians(x_deg) * 0.5
+    return np.array([math.cos(half), math.sin(half), 0.0, 0.0], dtype=np.float32)
+
+
+def quat_wxyz_from_xz_rotation_deg(x_deg: float, z_deg: float) -> np.ndarray:
+    x_half = math.radians(x_deg) * 0.5
+    z_half = math.radians(z_deg) * 0.5
+    qx = np.array([math.cos(x_half), math.sin(x_half), 0.0, 0.0], dtype=np.float64)
+    qz = np.array([math.cos(z_half), 0.0, 0.0, math.sin(z_half)], dtype=np.float64)
+    w1, x1, y1, z1 = qx
+    w2, x2, y2, z2 = qz
+    return np.array(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        dtype=np.float32,
+    )
+
+
 def look_at_quat_wxyz(eye: np.ndarray, target: np.ndarray, up_hint: np.ndarray) -> np.ndarray:
     forward = target - eye
     forward_norm = float(np.linalg.norm(forward))
@@ -1203,8 +1305,15 @@ def rotation_matrix_from_gf_transform(transform: Gf.Matrix4d) -> np.ndarray:
     )
 
 
+def normalized_quat_wxyz(quat: np.ndarray) -> np.ndarray:
+    normalized = np.asarray(quat, dtype=np.float64)
+    quat_norm = float(np.linalg.norm(normalized))
+    if quat_norm < 1e-9:
+        raise RuntimeError(f"Invalid zero-length quaternion: {quat}")
+    return (normalized / quat_norm).astype(np.float32)
+
+
 def real_layout_camera_specs(table_size: float, tabletop_z: float, arm_root_paths: dict[str, str]) -> list[dict[str, object]]:
-    table_center = np.array([0.0, 0.0, tabletop_z + 0.03], dtype=np.float32)
     d435i_position = np.array(
         [
             0.0,
@@ -1213,7 +1322,8 @@ def real_layout_camera_specs(table_size: float, tabletop_z: float, arm_root_path
         ],
         dtype=np.float32,
     )
-    d435i_horizontal_reach = REAL_LAYOUT_D435I_HEIGHT_ABOVE_TABLE / math.tan(
+    d435i_vertical_drop = REAL_LAYOUT_D435I_HEIGHT_ABOVE_TABLE - REAL_LAYOUT_D435I_TARGET_Z_OFFSET_M
+    d435i_horizontal_reach = d435i_vertical_drop / math.tan(
         math.radians(REAL_LAYOUT_D435I_DOWNWARD_ANGLE_DEG)
     )
     d435i_target = np.array(
@@ -1225,12 +1335,15 @@ def real_layout_camera_specs(table_size: float, tabletop_z: float, arm_root_path
         ],
         dtype=np.float32,
     )
+    d435i_orientation = quat_wxyz_from_xz_rotation_deg(
+        REAL_LAYOUT_D435I_ORIENTATION_X_DEG,
+        REAL_LAYOUT_D435I_ORIENTATION_Z_DEG,
+    )
     specs: list[dict[str, object]] = []
 
     def append_wrist_camera(camera_name: str, arm_label: str) -> None:
         if arm_label not in arm_root_paths:
             return
-        side_sign = -1.0 if arm_label == "front_left" else 1.0
         specs.append(
             {
                 "name": camera_name,
@@ -1239,27 +1352,17 @@ def real_layout_camera_specs(table_size: float, tabletop_z: float, arm_root_path
                 "stream": "rgb",
                 "source_camera": UGREEN_WRIST_CAMERA_REPORT["source_camera"],
                 "intrinsics_status": UGREEN_WRIST_CAMERA_REPORT["intrinsics_status"],
+                "extrinsics_status": UGREEN_WRIST_CAMERA_REPORT["extrinsics_status"],
+                "hand_eye_source": UGREEN_WRIST_CAMERA_REPORT["hand_eye_source"],
                 "resolution": WRIST_RGB_CAMERA_RESOLUTION,
-                "translation": env_vector3(
-                    "PANTHERA_WRIST_CAMERA_TRANSLATION",
-                    [-0.10, 0.22 * side_sign, 0.18],
-                ),
-                "target": table_center,
-                "up": np.array([0.0, 0.0, 1.0], dtype=np.float32),
-                "local_target": env_vector3(
-                    "PANTHERA_WRIST_CAMERA_LOCAL_TARGET",
-                    [0.18, 0.0, -0.12],
-                ),
-                "local_forward": env_vector3(
-                    "PANTHERA_WRIST_CAMERA_LOCAL_FORWARD",
-                    [1.0, -0.35 * side_sign, -0.65],
-                ),
-                "local_up": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+                "translation": UGREEN_WRIST_LINK6_TO_CAMERA_TRANSLATION_M.copy(),
+                "orientation": normalized_quat_wxyz(UGREEN_WRIST_LINK6_TO_USD_CAMERA_QUAT_WXYZ),
+                "camera_axes": "usd",
+                "opencv_to_usd_axes": "R_usd_camera = R_opencv_camera * diag(1,-1,-1)",
                 "intrinsics": None,
                 "focal_length_m": WRIST_RGB_CAMERA_FOCAL_LENGTH_M,
-                "horizontal_aperture_m": horizontal_aperture_for_fov(
-                    WRIST_RGB_CAMERA_FOCAL_LENGTH_M, WRIST_RGB_CAMERA_HORIZONTAL_FOV_DEG
-                ),
+                "horizontal_aperture_m": WRIST_RGB_CAMERA_HORIZONTAL_APERTURE_M,
+                "focus_distance_m": WRIST_RGB_CAMERA_FOCUS_DISTANCE_M,
             }
         )
 
@@ -1277,7 +1380,12 @@ def real_layout_camera_specs(table_size: float, tabletop_z: float, arm_root_path
                 "resolution": D435I_RGB_CAMERA_RESOLUTION,
                 "position": d435i_position,
                 "target": d435i_target,
-                "up": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+                "orientation": d435i_orientation,
+                "orientation_euler_xyz_deg": np.array(
+                    [REAL_LAYOUT_D435I_ORIENTATION_X_DEG, 0.0, REAL_LAYOUT_D435I_ORIENTATION_Z_DEG],
+                    dtype=np.float32,
+                ),
+                "camera_axes": "usd",
                 "intrinsics": D435I_RGB_INTRINSICS,
                 "focal_length_m": D435I_RGB_INTRINSICS["physical_focal_length_m"],
                 "horizontal_aperture_m": D435I_RGB_INTRINSICS["physical_focal_length_m"]
@@ -1294,7 +1402,12 @@ def real_layout_camera_specs(table_size: float, tabletop_z: float, arm_root_path
                 "resolution": D435I_DEPTH_CAMERA_RESOLUTION,
                 "position": d435i_position,
                 "target": d435i_target,
-                "up": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+                "orientation": d435i_orientation,
+                "orientation_euler_xyz_deg": np.array(
+                    [REAL_LAYOUT_D435I_ORIENTATION_X_DEG, 0.0, REAL_LAYOUT_D435I_ORIENTATION_Z_DEG],
+                    dtype=np.float32,
+                ),
+                "camera_axes": "usd",
                 "intrinsics": D435I_DEPTH_INTRINSICS,
                 "depth_intrinsics": D435I_DEPTH_INTRINSICS,
                 "focal_length_m": D435I_DEPTH_INTRINSICS["physical_focal_length_m"],
@@ -1308,6 +1421,8 @@ def real_layout_camera_specs(table_size: float, tabletop_z: float, arm_root_path
 
 
 def create_layout_cameras(table_size: float, tabletop_z: float, arm_root_paths: dict[str, str]) -> dict[str, Camera]:
+    from isaacsim.sensors.camera import Camera
+
     cameras = {}
     for spec in real_layout_camera_specs(table_size, tabletop_z, arm_root_paths):
         camera = Camera(
@@ -1317,29 +1432,34 @@ def create_layout_cameras(table_size: float, tabletop_z: float, arm_root_paths: 
             resolution=spec["resolution"],
         )
         if spec["mode"] == "world":
-            orientation = look_at_quat_wxyz(spec["position"], spec["target"], spec["up"])
-            camera.set_world_pose(position=spec["position"], orientation=orientation, camera_axes="world")
+            orientation = normalized_quat_wxyz(np.asarray(spec["orientation"], dtype=np.float32))
+            camera.set_world_pose(
+                position=spec["position"],
+                orientation=orientation,
+                camera_axes=spec["camera_axes"],
+            )
             focus_distance = float(np.linalg.norm(spec["position"] - spec["target"]))
+            print(
+                f"[Panthera-HT] Overhead camera {spec['name']}: "
+                f"position={np.asarray(spec['position']).tolist()} "
+                f"target={np.asarray(spec['target']).tolist()} "
+                f"orientation_euler_xyz_deg={np.asarray(spec['orientation_euler_xyz_deg']).tolist()} "
+                f"local_quat_wxyz={orientation.tolist()} camera_axes={spec['camera_axes']} "
+                f"downward_angle_deg={REAL_LAYOUT_D435I_DOWNWARD_ANGLE_DEG}"
+            )
         else:
             parent_path = spec["prim_path"].rsplit("/", 1)[0]
-            parent_transform = world_transform_for_prim(parent_path)
-            parent_rot = rotation_matrix_from_gf_transform(parent_transform)
-            position = world_point_from_prim_local_offset(parent_path, spec["translation"])
-            if "local_target" in spec:
-                target = world_point_from_prim_local_offset(parent_path, spec["local_target"])
-            else:
-                target = position + (parent_rot @ spec["local_forward"]).astype(np.float32)
-            orientation = look_at_quat_wxyz(position, target, (parent_rot @ spec["local_up"]).astype(np.float32))
-            camera.set_world_pose(position=position, orientation=orientation, camera_axes="world")
+            translation = np.asarray(spec["translation"], dtype=np.float32)
+            orientation = normalized_quat_wxyz(np.asarray(spec["orientation"], dtype=np.float32))
+            camera.set_local_pose(translation=translation, orientation=orientation, camera_axes=spec["camera_axes"])
             camera._panthera_wrist_parent_path = parent_path
-            camera._panthera_wrist_target = target
-            focus_distance = float(np.linalg.norm(target - position))
+            camera._panthera_wrist_hand_eye_source = spec["hand_eye_source"]
+            focus_distance = float(spec.get("focus_distance_m", WRIST_RGB_CAMERA_FOCUS_DISTANCE_M))
             print(
-                f"[Panthera-HT] Wrist camera aim {spec['name']}: "
-                f"position={position.tolist()} target={target.tolist()} "
-                f"local_translation={spec['translation'].tolist()} "
-                f"local_forward={spec['local_forward'].tolist()} "
-                f"local_target={spec.get('local_target')}"
+                f"[Panthera-HT] Wrist camera hand-eye {spec['name']}: "
+                f"parent={parent_path} local_translation={translation.tolist()} "
+                f"local_quat_wxyz={orientation.tolist()} camera_axes={spec['camera_axes']} "
+                f"source={spec['hand_eye_source']}"
             )
         camera.set_focal_length(spec["focal_length_m"])
         camera.set_horizontal_aperture(spec["horizontal_aperture_m"])
@@ -1389,7 +1509,25 @@ def verify_layout_camera_bindings(cameras: dict[str, Camera]) -> None:
                 f"Layout camera {camera_name} is not bound to wrist link {WRIST_CAMERA_LINK_NAME}: "
                 f"parent={actual_parent}, expected={expected_parent}"
             )
-        print(f"[Panthera-HT] Layout camera {camera_name} bound to wrist parent: {actual_parent}")
+        local_translation, local_orientation = camera.get_local_pose(camera_axes="usd")
+        translation_error = float(
+            np.linalg.norm(np.asarray(local_translation, dtype=np.float64) - UGREEN_WRIST_LINK6_TO_CAMERA_TRANSLATION_M)
+        )
+        orientation_dot = abs(
+            float(
+                np.dot(
+                    normalized_quat_wxyz(np.asarray(local_orientation, dtype=np.float32)),
+                    normalized_quat_wxyz(UGREEN_WRIST_LINK6_TO_USD_CAMERA_QUAT_WXYZ),
+                )
+            )
+        )
+        print(
+            f"[Panthera-HT] Layout camera {camera_name} bound to wrist parent: {actual_parent}; "
+            f"local_translation={np.asarray(local_translation).tolist()} "
+            f"local_quat_wxyz={np.asarray(local_orientation).tolist()} "
+            f"hand_eye_translation_error_m={translation_error:.9f} "
+            f"hand_eye_quat_abs_dot={orientation_dot:.9f}"
+        )
     return
 
 
@@ -1398,8 +1536,8 @@ def layout_camera_pose_signatures(cameras: dict[str, Camera]) -> dict[str, dict[
     for camera_name, camera in cameras.items():
         transform = world_transform_for_prim(camera.prim_path)
         origin = transform.Transform(Gf.Vec3d(0.0, 0.0, 0.0))
-        forward_point = transform.Transform(Gf.Vec3d(1.0, 0.0, 0.0))
-        up_point = transform.Transform(Gf.Vec3d(0.0, 0.0, 1.0))
+        forward_point = transform.Transform(Gf.Vec3d(0.0, 0.0, -1.0))
+        up_point = transform.Transform(Gf.Vec3d(0.0, 1.0, 0.0))
         position = np.array([origin[0], origin[1], origin[2]], dtype=np.float64)
         forward = np.array(
             [forward_point[0] - origin[0], forward_point[1] - origin[1], forward_point[2] - origin[2]],
@@ -1463,6 +1601,8 @@ def create_layout_camera_live_viewports(cameras: dict[str, Camera]) -> list[obje
         carb.log_info("Panthera-HT live layout camera viewports skipped because headless=True")
         return []
 
+    from isaacsim.core.utils.viewports import create_viewport_for_camera
+
     viewport_width, viewport_height = LIVE_LAYOUT_CAMERA_VIEWPORT_SIZE
     windows = []
     for viewport_index, camera_name in enumerate(LIVE_LAYOUT_CAMERA_VIEWPORT_NAMES):
@@ -1486,6 +1626,17 @@ def create_layout_camera_live_viewports(cameras: dict[str, Camera]) -> list[obje
         print(f"[Panthera-HT] Live layout camera viewport ready: {camera_name} -> {camera.prim_path}")
         carb.log_info(f"Panthera-HT live layout camera viewport ready: {camera_name} -> {camera.prim_path}")
     return windows
+
+
+def destroy_layout_camera_live_viewports(windows: list[object]) -> None:
+    for window in windows:
+        destroy = getattr(window, "destroy", None)
+        if destroy is None:
+            continue
+        try:
+            destroy()
+        except Exception as exc:
+            carb.log_warn(f"Failed to destroy Panthera live camera viewport cleanly: {exc}")
 
 
 def realism_capture_postprocess(rgb: np.ndarray, camera_name: str) -> np.ndarray:
@@ -1667,7 +1818,7 @@ def save_layout_camera_sequence(
         for panthera in pantheras:
             panthera.set_joint_positions(pose_for_dofs(panthera.dof_names, frame_index, args.no_motion))
         for _ in range(LAYOUT_CAMERA_SEQUENCE_WARMUP_FRAMES):
-            world.step(render=True)
+            world.step(render=render_enabled)
 
         frame_dir = output_dir / f"frame_{frame_index:06d}"
         frame_dir.mkdir(parents=True, exist_ok=True)
@@ -1739,6 +1890,8 @@ def save_layout_camera_sequence(
             "arm_corner_inset_m": REAL_LAYOUT_ARM_CORNER_INSET,
             "robot_yaw_deg": REAL_LAYOUT_ROBOT_YAW_DEG,
             "d435i_height_above_table_m": REAL_LAYOUT_D435I_HEIGHT_ABOVE_TABLE,
+            "d435i_orientation_x_deg": REAL_LAYOUT_D435I_ORIENTATION_X_DEG,
+            "d435i_orientation_z_deg": REAL_LAYOUT_D435I_ORIENTATION_Z_DEG,
             "d435i_downward_angle_deg": REAL_LAYOUT_D435I_DOWNWARD_ANGLE_DEG,
         },
         "camera_reports": {
@@ -1766,7 +1919,9 @@ def save_layout_camera_sequence(
         ),
         "sim_to_real_note": (
             "D435i RGB/depth intrinsics match the supplied 640x480@30 SDK profiles. "
-            "UGREEN wrist cameras remain approximate 85deg FOV proxies until real calibration supplies fx/fy/cx/cy/distortion."
+            "UGREEN wrist camera extrinsics use the measured link6-to-camera hand-eye transform converted to USD "
+            "camera axes; their intrinsics remain approximate 85deg FOV proxies until real calibration supplies "
+            "fx/fy/cx/cy/distortion."
         ),
     }
     write_json(manifest_path, manifest)
@@ -2032,8 +2187,9 @@ def should_keep_running() -> bool:
     if not args.headless and not simulation_app.is_running():
         if not _reported_is_running_false:
             _reported_is_running_false = True
-            print("[Panthera-HT] SimulationApp.is_running() became false; keeping scene alive until explicit close.")
-            carb.log_warn("SimulationApp.is_running() is false; keeping Panthera scene alive until explicit close.")
+            print("[Panthera-HT] SimulationApp.is_running() became false; exiting scene loop.")
+            carb.log_warn("SimulationApp.is_running() is false; exiting Panthera scene loop.")
+        return False
     return True
 
 
@@ -2088,8 +2244,19 @@ def main() -> None:
     carb.log_info(f"Using Panthera-HT mesh directory: {mesh_dir}")
 
     world = World(stage_units_in_meters=1.0)
-    world.scene.add_default_ground_plane()
-    set_camera_view(eye=[1.35, 1.05, 1.10], target=[0.0, 0.0, 0.78], camera_prim_path="/OmniverseKit_Persp")
+    world.scene.add(
+        GroundPlane(
+            prim_path="/World/GroundPlane",
+            name="ground_plane",
+            z_position=0.0,
+            size=8.0,
+            color=np.array([0.42, 0.44, 0.43], dtype=np.float32),
+        )
+    )
+    if render_enabled:
+        from isaacsim.core.utils.viewports import set_camera_view
+
+        set_camera_view(eye=[1.35, 1.05, 1.10], target=[0.0, 0.0, 0.78], camera_prim_path="/OmniverseKit_Persp")
     rng = realism_rng()
 
     tabletop_z = add_table_scene(world, args.table_size, args.table_height)
@@ -2139,7 +2306,7 @@ def main() -> None:
 
     for panthera in pantheras:
         panthera.set_joint_positions(pose_for_dofs(panthera.dof_names, 0, args.no_motion))
-    world.step(render=True)
+    world.step(render=render_enabled)
     print_layout_arm_reach_evidence(arms, "initial")
 
     arm_root_paths = {arm["label"]: arm["root_path"] for arm in arms}
@@ -2209,7 +2376,7 @@ def main() -> None:
             if aligned_initial_state7 is None:
                 raise RuntimeError("Dataset action replay initial-state alignment requested, but replay file has no state7")
             active_panthera.set_joint_positions(replay_action_target_for_dofs(active_panthera.dof_names, aligned_initial_state7))
-            world.step(render=True)
+            world.step(render=render_enabled)
             panthera_log(
                 f"[Panthera-HT][Replay] Initial state alignment applied from episode0 state7="
                 f"{aligned_initial_state7} arm={active_arm_label}"
@@ -2266,7 +2433,7 @@ def main() -> None:
     if layout_cameras and not args.skip_layout_screenshots and not args.enable_dataset_action_replay:
         sequence_frames = parse_layout_sequence_frames(args.layout_sequence_frames)
         for _ in range(LAYOUT_CAMERA_CAPTURE_WARMUP_FRAMES):
-            world.step(render=True)
+            world.step(render=render_enabled)
         initial_camera_poses = layout_camera_pose_signatures(layout_cameras)
         screenshot_paths = save_layout_camera_screenshots(layout_cameras, "initial")
         for screenshot_path in screenshot_paths:
@@ -2281,7 +2448,7 @@ def main() -> None:
                     pose_for_dofs(panthera.dof_names, LAYOUT_CAMERA_MOTION_PROOF_FRAME, args.no_motion)
                 )
             for _ in range(LAYOUT_CAMERA_MOTION_PROOF_WARMUP_FRAMES):
-                world.step(render=True)
+                world.step(render=render_enabled)
             print_layout_arm_reach_evidence(arms, "after_motion")
             after_motion_camera_poses = layout_camera_pose_signatures(layout_cameras)
             print_layout_camera_motion_evidence(
@@ -2307,7 +2474,7 @@ def main() -> None:
 
     if args.enable_smolvla_policy:
         for _ in range(LAYOUT_CAMERA_CAPTURE_WARMUP_FRAMES):
-            world.step(render=True)
+            world.step(render=render_enabled)
         warmup_action7 = run_smolvla_policy_inference(frame_index, active_panthera, layout_cameras, active_arm_label)
         policy_inference_count += 1
         last_policy_action7 = warmup_action7
@@ -2341,7 +2508,7 @@ def main() -> None:
 
     try:
         while should_keep_running():
-            world.step(render=True)
+            world.step(render=render_enabled)
 
             if world.is_stopped() and not reset_needed:
                 reset_needed = True
@@ -2510,6 +2677,7 @@ def main() -> None:
             )
         print(f"[Panthera-HT] Scene exiting: {exit_reason}")
         carb.log_info(f"Panthera-HT scene exiting: {exit_reason}")
+        destroy_layout_camera_live_viewports(live_layout_viewports)
         omni.timeline.get_timeline_interface().stop()
         simulation_app.close()
 

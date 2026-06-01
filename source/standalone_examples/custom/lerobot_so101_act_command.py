@@ -6,10 +6,13 @@ from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": False, "renderer": "RaytracedLighting"})
 
 import argparse
+import atexit
 from dataclasses import dataclass
 import json
 import math
 import os
+import select
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -28,13 +31,37 @@ from isaacsim.core.prims import Articulation, XFormPrim
 from isaacsim.core.utils.render_product import get_camera_prim_path
 from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.sensors.camera import Camera
-from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+LEROBOT_IMPORT_ERROR: Exception | None = None
 try:
+    from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+except Exception as exc:
+    LEROBOT_IMPORT_ERROR = exc
+    FeatureType = None
+    NormalizationMode = None
+    PolicyFeature = None
+try:
+    if LEROBOT_IMPORT_ERROR is not None:
+        raise LEROBOT_IMPORT_ERROR
     from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
-except ImportError:
-    from lerobot.constants import ACTION, OBS_ENV_STATE, OBS_STATE
-from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.act.modeling_act import ACTPolicy
+except Exception:
+    try:
+        if LEROBOT_IMPORT_ERROR is not None:
+            raise LEROBOT_IMPORT_ERROR
+        from lerobot.constants import ACTION, OBS_ENV_STATE, OBS_STATE
+    except Exception:
+        ACTION = "action"
+        OBS_ENV_STATE = "observation.environment_state"
+        OBS_STATE = "observation.state"
+try:
+    if LEROBOT_IMPORT_ERROR is not None:
+        raise LEROBOT_IMPORT_ERROR
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.act.modeling_act import ACTPolicy
+except Exception as exc:
+    if LEROBOT_IMPORT_ERROR is None:
+        LEROBOT_IMPORT_ERROR = exc
+    ACTConfig = None
+    ACTPolicy = None
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux
 
 
@@ -72,6 +99,11 @@ def _get_robot_profile(robot_model: str) -> dict[str, Any]:
     if key not in ROBOT_PROFILES:
         raise RuntimeError(f"Unsupported robot-model={robot_model!r}. Choose one of: {', '.join(ROBOT_PROFILES.keys())}")
     return ROBOT_PROFILES[key]
+
+
+@dataclass
+class RuntimeImageFeature:
+    shape: tuple[int, int, int]
 
 
 def resolve_robot_urdf_path(robot_model: str) -> str:
@@ -1215,7 +1247,10 @@ class SmolVLAPrior:
                 for key in (OBS_STATE, ACTION):
                     if key not in stats or not isinstance(stats[key], dict):
                         continue
-                    values.extend(stats[key].values())
+                    for stat_name, value in stats[key].items():
+                        if stat_name == "count":
+                            continue
+                        values.append(value)
         return values
 
     def _infer_joint_unit_mode(self) -> str:
@@ -1295,6 +1330,8 @@ class _BatchIdentityModule(torch.nn.Module):
 
 
 def train_act_command_policy(device: torch.device) -> ACTPolicy:
+    if ACTConfig is None or ACTPolicy is None or PolicyFeature is None or FeatureType is None or NormalizationMode is None:
+        raise RuntimeError(f"LeRobot ACT is not available in this Python environment: {LEROBOT_IMPORT_ERROR}")
     cfg = ACTConfig(
         n_obs_steps=1,
         chunk_size=1,
@@ -1467,6 +1504,222 @@ def _tensor_batch_to_u8_hwc(tensor: torch.Tensor) -> np.ndarray:
     if float(arr.max()) <= 1.0 + 1e-6:
         arr = arr * 255.0
     return np.clip(arr, 0.0, 255.0).astype(np.uint8)
+
+
+class ExternalSmolVLAPrior:
+    """Run LeRobot 0.5 SmolVLA in a Python 3.12 subprocess and keep IsaacSim on Python 3.11."""
+
+    def __init__(
+        self,
+        model_id: str,
+        device: str,
+        python_path: str,
+        script_path: str,
+        work_dir: Path,
+        local_files_only: bool = True,
+        vlm_model_path: str = "",
+        dataset_root: str = "",
+        joint_unit_mode: str = "radians",
+        startup_timeout_s: float = 180.0,
+        request_timeout_s: float = 180.0,
+    ):
+        self.model_id = model_id
+        self.device = device
+        self.request_timeout_s = float(request_timeout_s)
+        self.work_dir = work_dir
+        self.frame_dir = work_dir / "external_smolvla_frames"
+        self.frame_dir.mkdir(parents=True, exist_ok=True)
+        self.log_path = work_dir / "external_smolvla_server.log"
+        self._request_id = 0
+        self._stderr_file = open(self.log_path, "a", encoding="utf-8")
+
+        cmd = [
+            os.path.expanduser(python_path),
+            os.path.expanduser(script_path),
+            "--model-id",
+            model_id,
+            "--device",
+            device,
+            "--server",
+            "--dataset-root",
+            dataset_root,
+            "--joint-unit-mode",
+            joint_unit_mode,
+        ]
+        if local_files_only:
+            cmd.append("--local-files-only")
+        if vlm_model_path:
+            cmd.extend(["--vlm-model-path", os.path.expanduser(vlm_model_path)])
+
+        env = os.environ.copy()
+        # IsaacSim's launcher injects Python 3.11 paths. The external LeRobot venv is
+        # Python 3.12, so those variables must not leak into the model subprocess.
+        for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE"):
+            env.pop(key, None)
+        if local_files_only:
+            env.setdefault("HF_HUB_OFFLINE", "1")
+            env.setdefault("TRANSFORMERS_OFFLINE", "1")
+            env.setdefault("HF_HUB_DISABLE_XET", "1")
+
+        self.process = subprocess.Popen(
+            cmd,
+            cwd=str(Path(__file__).resolve().parents[3]),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._stderr_file,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        atexit.register(self.close)
+        ready = self._read_message(startup_timeout_s)
+        while ready.get("type") != "ready":
+            ready = self._read_message(startup_timeout_s)
+        self.ready = ready
+        image_shapes = ready.get("image_shapes") or {
+            "observation.images.camera1": [3, 256, 256],
+            "observation.images.camera2": [3, 256, 256],
+        }
+        self.image_features = {
+            key: RuntimeImageFeature(tuple(int(v) for v in shape))
+            for key, shape in image_shapes.items()
+            if str(key).startswith("observation.images.") and len(shape) == 3
+        }
+        if not self.image_features:
+            raise RuntimeError(f"External SmolVLA server reported no image features: {ready}")
+        self.image_keys = list(self.image_features.keys())
+        self.state_dim = int((ready.get("state_shape") or [6])[0])
+        self.action_dim = int((ready.get("action_shape") or [6])[0])
+        carb.log_info(
+            "External SmolVLA server ready: "
+            f"pid={self.process.pid}, action_shape={ready.get('action_shape')}, "
+            f"state_shape={ready.get('state_shape')}, image_keys={self.image_keys}, "
+            f"chunk_size={ready.get('chunk_size')}, n_action_steps={ready.get('n_action_steps')}, "
+            f"log={self.log_path}"
+        )
+
+    def close(self) -> None:
+        process = getattr(self, "process", None)
+        if process is None:
+            return
+        if process.poll() is None:
+            try:
+                if process.stdin is not None:
+                    process.stdin.write(json.dumps({"type": "shutdown"}) + "\n")
+                    process.stdin.flush()
+            except Exception:
+                pass
+            try:
+                process.terminate()
+            except Exception:
+                pass
+        self.process = None
+        try:
+            self._stderr_file.close()
+        except Exception:
+            pass
+
+    def _read_message(self, timeout_s: float) -> dict[str, Any]:
+        if self.process.stdout is None:
+            raise RuntimeError("External SmolVLA server stdout is not available")
+        fd = self.process.stdout.fileno()
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError(
+                    f"External SmolVLA server exited with code={self.process.returncode}. "
+                    f"See log: {self.log_path}"
+                )
+            ready, _, _ = select.select([fd], [], [], min(0.25, max(0.0, deadline - time.time())))
+            if not ready:
+                continue
+            line = self.process.stdout.readline()
+            if not line:
+                continue
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                carb.log_info(f"External SmolVLA: {text}")
+        raise TimeoutError(f"Timed out waiting for External SmolVLA server. See log: {self.log_path}")
+
+    def _image_tensor_for_key(self, key: str, image_tensors: dict[str, torch.Tensor] | None) -> torch.Tensor:
+        feature = self.image_features[key]
+        if image_tensors is not None and key in image_tensors:
+            return image_tensors[key]
+        c, h, w = feature.shape
+        return torch.zeros((1, c, h, w), dtype=torch.float32)
+
+    def _write_frame_json(
+        self,
+        joint_state_6: np.ndarray,
+        task_text: str,
+        image_tensors: dict[str, torch.Tensor] | None,
+    ) -> Path:
+        self._request_id += 1
+        stem = f"request_{self._request_id:07d}"
+        frame_root = self.frame_dir / stem
+        frame_root.mkdir(parents=True, exist_ok=True)
+        image_paths: dict[str, str] = {}
+        for key in self.image_keys:
+            image_path = frame_root / f"{_safe_name(key)}.png"
+            _save_image_u8(image_path, _tensor_batch_to_u8_hwc(self._image_tensor_for_key(key, image_tensors)))
+            image_paths[key] = str(image_path)
+
+        def _path_for_camera(token: str, fallback_index: int) -> str:
+            for key, path in image_paths.items():
+                if token in key.lower():
+                    return path
+            values = list(image_paths.values())
+            return values[min(fallback_index, len(values) - 1)]
+
+        payload = {
+            "state7": [float(v) for v in np.asarray(joint_state_6, dtype=np.float32).reshape(-1)[:6].tolist()],
+            "task": task_text if task_text else "pick up the block",
+            "camera1_path": _path_for_camera("camera1", 0),
+            "camera2_path": _path_for_camera("camera2", 1),
+            "camera1_source": "top",
+            "camera2_source": "wrist",
+            "state_source": "so100_6d",
+            "control_mode": "so100_gui",
+            "frame_index": self._request_id,
+        }
+        frame_json = frame_root / "frame.json"
+        frame_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return frame_json
+
+    def predict_target(
+        self, joint_state_6: np.ndarray, task_text: str, image_tensors: dict[str, torch.Tensor] | None = None
+    ) -> np.ndarray:
+        if self.process is None or self.process.stdin is None:
+            raise RuntimeError("External SmolVLA server is not running")
+        frame_json = self._write_frame_json(joint_state_6, task_text, image_tensors)
+        request_id = self._request_id
+        request = {
+            "request_id": request_id,
+            "frame_json": str(frame_json),
+            "frame_index": request_id,
+            "task_text": task_text,
+            "control_mode": "so100_gui",
+        }
+        self.process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+        self.process.stdin.flush()
+        while True:
+            message = self._read_message(self.request_timeout_s)
+            if message.get("request_id") != request_id:
+                continue
+            if message.get("type") == "error":
+                raise RuntimeError(f"External SmolVLA inference failed: {message.get('error')}")
+            result = message.get("result", {})
+            action = result.get("predicted_action_step0")
+            if action is None:
+                action = result.get("predicted_action")
+            action_np = np.asarray(action, dtype=np.float32).reshape(-1)
+            if action_np.shape[0] < 6:
+                raise RuntimeError(f"External SmolVLA action dim is too small: {action_np.shape[0]}")
+            return action_np[:6]
 
 
 def _jsonify_record_value(value: Any) -> Any:
@@ -2266,6 +2519,49 @@ def main() -> None:
         help="load SmolVLA model from local cache only",
     )
     parser.add_argument(
+        "--smolvla-external-server",
+        action="store_true",
+        help="run SmolVLA inference in a separate Python process; needed when IsaacSim Python cannot import LeRobot 0.5",
+    )
+    parser.add_argument(
+        "--smolvla-python",
+        type=str,
+        default=str(Path(__file__).resolve().parents[3] / ".venv-lerobot" / "bin" / "python"),
+        help="Python executable for --smolvla-external-server",
+    )
+    parser.add_argument(
+        "--smolvla-infer-script",
+        type=str,
+        default=str(Path(__file__).resolve().parents[3] / "tools" / "lerobot" / "panthera_smolvla_infer.py"),
+        help="line-protocol SmolVLA inference script for --smolvla-external-server",
+    )
+    parser.add_argument(
+        "--smolvla-vlm-model-path",
+        type=str,
+        default=str(
+            Path.home()
+            / ".cache"
+            / "huggingface"
+            / "hub"
+            / "models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct"
+            / "snapshots"
+            / "7b375e1b73b11138ff12fe22c8f2822d8fe03467"
+        ),
+        help="local SmolVLM path used by the external SmolVLA server",
+    )
+    parser.add_argument(
+        "--smolvla-dataset-root",
+        type=str,
+        default="",
+        help="optional LeRobot dataset root for external SmolVLA stats; empty means use checkpoint defaults",
+    )
+    parser.add_argument(
+        "--smolvla-server-timeout",
+        type=float,
+        default=180.0,
+        help="timeout in seconds for external SmolVLA startup and inference requests",
+    )
+    parser.add_argument(
         "--download-smolvla-only",
         action="store_true",
         help="only download/load SmolVLA and exit",
@@ -2513,6 +2809,11 @@ def main() -> None:
         carb.log_info("Live joint target file control enabled. Skipping local command ACT training.")
     elif args.disable_command_act:
         carb.log_info("Local command ACT disabled. Using command templates as base target.")
+    elif LEROBOT_IMPORT_ERROR is not None:
+        carb.log_warn(
+            "Local command ACT unavailable in this IsaacSim Python. "
+            f"Using command templates as base target. reason={LEROBOT_IMPORT_ERROR}"
+        )
     else:
         carb.log_info(f"Training ACT command policy on device: {policy_device}")
         act_policy = train_act_command_policy(policy_device)
@@ -2537,32 +2838,61 @@ def main() -> None:
     smolvla_prior = None
     smolvla_cfg = None
     smolvla_device = torch.device(args.smolvla_device)
+    smolvla_image_features: dict[str, Any] | None = None
     smolvla_image_provider: SmolVLAImageProvider | None = None
     if args.enable_joint_target_file and args.enable_smolvla_prior:
         carb.log_info("Live joint target file control enabled. Skipping SmolVLA prior loading.")
     elif args.enable_smolvla_prior or args.download_smolvla_only:
-        try:
-            carb.log_info(f"Loading SmolVLA prior: {args.smolvla_model_id} on device={smolvla_device}")
-            smolvla_load_t0 = time.perf_counter()
-            smolvla_policy, smolvla_cfg_loaded = load_hf_pretrained_smolvla_policy(
-                args.smolvla_model_id, device=smolvla_device, local_files_only=args.smolvla_local_files_only
-            )
-            smolvla_cfg = smolvla_cfg_loaded
-            smolvla_load_ms = (time.perf_counter() - smolvla_load_t0) * 1000.0
-            smolvla_prior = SmolVLAPrior(
-                smolvla_policy,
-                smolvla_cfg,
-                smolvla_device,
-                pretrained_path=args.smolvla_model_id,
-            )
-            carb.log_info(
-                f"SmolVLA loaded. action_shape={smolvla_cfg.action_feature.shape}, image_keys={smolvla_prior.image_keys}, "
-                f"prior_alpha={args.smolvla_prior_alpha:.2f}, device={smolvla_device}"
-            )
-            if args.profile_smolvla:
-                carb.log_info(f"SmolVLA model load time: {smolvla_load_ms:.1f} ms")
-        except Exception as exc:
-            carb.log_warn(f"Failed to load SmolVLA prior, fallback to non-SmolVLA control. reason={exc}")
+        if args.smolvla_external_server:
+            try:
+                carb.log_info(
+                    f"Starting external SmolVLA prior: {args.smolvla_model_id} "
+                    f"python={args.smolvla_python} device={args.smolvla_device}"
+                )
+                smolvla_load_t0 = time.perf_counter()
+                smolvla_prior = ExternalSmolVLAPrior(
+                    model_id=args.smolvla_model_id,
+                    device=args.smolvla_device,
+                    python_path=args.smolvla_python,
+                    script_path=args.smolvla_infer_script,
+                    work_dir=vla_io_dir,
+                    local_files_only=args.smolvla_local_files_only,
+                    vlm_model_path=args.smolvla_vlm_model_path,
+                    dataset_root=args.smolvla_dataset_root,
+                    joint_unit_mode="radians",
+                    startup_timeout_s=args.smolvla_server_timeout,
+                    request_timeout_s=args.smolvla_server_timeout,
+                )
+                smolvla_image_features = smolvla_prior.image_features
+                smolvla_load_ms = (time.perf_counter() - smolvla_load_t0) * 1000.0
+                if args.profile_smolvla:
+                    carb.log_info(f"External SmolVLA startup time: {smolvla_load_ms:.1f} ms")
+            except Exception as exc:
+                carb.log_warn(f"Failed to start external SmolVLA prior, fallback to non-SmolVLA control. reason={exc}")
+        else:
+            try:
+                carb.log_info(f"Loading SmolVLA prior: {args.smolvla_model_id} on device={smolvla_device}")
+                smolvla_load_t0 = time.perf_counter()
+                smolvla_policy, smolvla_cfg_loaded = load_hf_pretrained_smolvla_policy(
+                    args.smolvla_model_id, device=smolvla_device, local_files_only=args.smolvla_local_files_only
+                )
+                smolvla_cfg = smolvla_cfg_loaded
+                smolvla_image_features = smolvla_cfg.image_features
+                smolvla_load_ms = (time.perf_counter() - smolvla_load_t0) * 1000.0
+                smolvla_prior = SmolVLAPrior(
+                    smolvla_policy,
+                    smolvla_cfg,
+                    smolvla_device,
+                    pretrained_path=args.smolvla_model_id,
+                )
+                carb.log_info(
+                    f"SmolVLA loaded. action_shape={smolvla_cfg.action_feature.shape}, image_keys={smolvla_prior.image_keys}, "
+                    f"prior_alpha={args.smolvla_prior_alpha:.2f}, device={smolvla_device}"
+                )
+                if args.profile_smolvla:
+                    carb.log_info(f"SmolVLA model load time: {smolvla_load_ms:.1f} ms")
+            except Exception as exc:
+                carb.log_warn(f"Failed to load SmolVLA prior, fallback to non-SmolVLA control. reason={exc}")
 
     if args.download_hf_only:
         carb.log_info("Download/load HF-only mode complete. Exiting.")
@@ -2573,10 +2903,10 @@ def main() -> None:
         simulation_app.close()
         return
 
-    if smolvla_prior is not None and smolvla_cfg is not None:
+    if smolvla_prior is not None and smolvla_image_features is not None:
         try:
             smolvla_image_provider = SmolVLAImageProvider(
-                smolvla_cfg.image_features,
+                smolvla_image_features,
                 robot_root_path=robot_root_path,
                 pick_object_prim_path=active_object_prim_path,
                 refresh_render_fn=world.render,
@@ -2588,7 +2918,7 @@ def main() -> None:
         except Exception as exc:
             raise RuntimeError(
                 "SmolVLA image provider init failed. "
-                f"image_keys={list(smolvla_cfg.image_features.keys())}, reason={exc}"
+                f"image_keys={list(smolvla_image_features.keys())}, reason={exc}"
             )
 
     watcher = CommandFileWatcher(args.command_file)

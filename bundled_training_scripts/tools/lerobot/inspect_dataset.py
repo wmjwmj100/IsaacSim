@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Any
 
@@ -12,12 +11,6 @@ import numpy as np
 
 def _safe_name(text: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text)
-
-
-def _clear_bad_proxy_env() -> None:
-    for key in ("ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
-        os.environ.pop(key, None)
-    os.environ.pop("HF_HUB_DISABLE_XET", None)
 
 
 def _to_pil_image(value: Any):
@@ -105,8 +98,6 @@ def _save_frame_artifacts(repo_id: str, episode_index: int, output_dir: Path, vi
 
 
 def main() -> None:
-    _clear_bad_proxy_env()
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-id", default="lerobot/svla_so101_pickplace")
     parser.add_argument("--dataset-root", default=None)

@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import argparse
 import json
-import os
 import shutil
 from pathlib import Path
+from typing import Any
 
 
 def _clear_bad_proxy_env() -> None:
+    import os
+
     for key in ("ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
         os.environ.pop(key, None)
     os.environ.pop("HF_HUB_DISABLE_XET", None)
 
 
 def _resolve_local_hf_snapshot(repo_id: str, required_files: tuple[str, ...]) -> Path | None:
+    import os
+
     cache_root = Path(os.environ.get("HF_HUB_CACHE", Path.home() / ".cache" / "huggingface" / "hub"))
     snapshot_root = cache_root / f"models--{repo_id.replace('/', '--')}" / "snapshots"
     if not snapshot_root.is_dir():
@@ -26,17 +32,19 @@ def _resolve_local_hf_snapshot(repo_id: str, required_files: tuple[str, ...]) ->
     return None
 
 
+def _load_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def _feature_shape(dataset_root: str, feature_key: str) -> tuple[int, ...]:
     info_path = Path(dataset_root).expanduser() / "meta" / "info.json"
-    with info_path.open("r", encoding="utf-8") as file:
-        info = json.load(file)
+    info = _load_json(info_path)
     return tuple(info["features"][feature_key]["shape"])
 
 
 def _resolve_image_feature_key(dataset_root: str, candidates: tuple[str, ...]) -> str:
     info_path = Path(dataset_root).expanduser() / "meta" / "info.json"
-    with info_path.open("r", encoding="utf-8") as file:
-        info = json.load(file)
+    info = _load_json(info_path)
     features = info["features"]
     for key in candidates:
         if key in features:
@@ -51,41 +59,83 @@ def _image_policy_shape(dataset_root: str, feature_key: str) -> tuple[int, int, 
     return (shape[2], shape[0], shape[1])
 
 
+def _list_episode_indices(dataset_root: Path) -> list[int]:
+    import pyarrow.parquet as pq
+
+    episodes_path = dataset_root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(episodes_path)
+    return [int(item["episode_index"]) for item in table.to_pylist()]
+
+
+def _write_split_plan(path: Path, train_episodes: list[int], val_episodes: list[int]) -> None:
+    payload = {
+        "train_episodes": train_episodes,
+        "val_episodes": val_episodes,
+        "train_count": len(train_episodes),
+        "val_count": len(val_episodes),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fine-tune lerobot/smolvla_base on the local Panthera-HT dataset.")
-    parser.add_argument("--dataset-root", default="outputs/lerobot_datasets/panthera_ht_merged")
-    parser.add_argument("--dataset-repo-id", default="local/panthera_ht_merged")
+    parser = argparse.ArgumentParser(description="Fine-tune SmolVLA on the Roboclaw wide-position dataset.")
     parser.add_argument(
-        "--episodes",
-        default="",
-        help="Optional comma-separated episode indices to train on, e.g. '0' or '0,1,2'.",
+        "--dataset-root",
+        default="outputs/lerobot_datasets/roboclaw_sim_teacher_widepos_117ep",
+    )
+    parser.add_argument(
+        "--dataset-repo-id",
+        default="local/roboclaw_sim_teacher_widepos_117ep",
+    )
+    parser.add_argument(
+        "--train-episodes",
+        default="0:110",
+        help="Train episode selection. Use '0:110' for the first 110 episodes.",
+    )
+    parser.add_argument(
+        "--val-episodes",
+        default="110:117",
+        help="Hold-out episode selection. Use '110:117' for the last 7 episodes.",
     )
     parser.add_argument("--base-model", default="lerobot/smolvla_base")
-    parser.add_argument("--output-dir", default="outputs/train/panthera_ht_smolvla_ft")
-    parser.add_argument("--job-name", default="panthera_ht_smolvla_ft")
-    parser.add_argument("--steps", type=int, default=200)
+    parser.add_argument(
+        "--base-checkpoint",
+        default="outputs/train/roboclaw_sim_teacher_widepos_clean_89ep_smolvla_20k_cont_from5k/checkpoints/015000/pretrained_model",
+        help="Checkpoint used as initialization. This starts a new run from these weights.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="outputs/train/roboclaw_sim_teacher_widepos_117ep_smolvla_20k_cont_from15k",
+    )
+    parser.add_argument("--job-name", default="roboclaw_sim_teacher_widepos_117ep_smolvla_20k_cont_from15k")
+    parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--log-freq", type=int, default=10)
-    parser.add_argument("--save-freq", type=int, default=None)
+    parser.add_argument("--log-freq", type=int, default=100)
+    parser.add_argument("--save-freq", type=int, default=5000)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
     _clear_bad_proxy_env()
-    episodes = [int(item.strip()) for item in args.episodes.split(",") if item.strip()]
 
-    # Import SmolVLA before parsing pretrained configs so draccus registers the policy type.
+    dataset_root = Path(args.dataset_root).expanduser()
+    train_episodes = _expand_episode_spec(args.train_episodes)
+    val_episodes = _expand_episode_spec(args.val_episodes)
+    output_dir = Path(args.output_dir).expanduser()
+    if args.overwrite and output_dir.exists():
+        shutil.rmtree(output_dir)
+    split_plan_path = output_dir.parent / f"{output_dir.name}_split_plan.json"
+    _write_split_plan(split_plan_path, train_episodes, val_episodes)
+
+    # Import after env cleanup to avoid HF proxy issues.
     from lerobot.configs.default import DatasetConfig
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.configs.train import TrainPipelineConfig
     from lerobot.configs.types import FeatureType, PolicyFeature
     from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig as _SmolVLAConfig  # noqa: F401
     from lerobot.scripts.lerobot_train import train
-
-    output_dir = Path(args.output_dir).expanduser()
-    if args.overwrite and output_dir.exists():
-        shutil.rmtree(output_dir)
 
     local_base_model = _resolve_local_hf_snapshot(args.base_model, ("config.json", "model.safetensors"))
     local_vlm_model = _resolve_local_hf_snapshot(
@@ -107,7 +157,7 @@ def main() -> None:
         ("observation.images.side", "observation.images.wrist"),
     )
     print(f"Image mapping: OBS_IMAGE_1={top_image_key} -> camera1, OBS_IMAGE_2={wrist_image_key} -> camera2")
-    policy.pretrained_path = local_base_model or Path(args.base_model)
+    policy.pretrained_path = Path(args.base_checkpoint).expanduser()
     policy.device = args.device
     policy.use_amp = False
     policy.push_to_hub = False
@@ -143,7 +193,7 @@ def main() -> None:
         dataset=DatasetConfig(
             repo_id=args.dataset_repo_id,
             root=args.dataset_root,
-            episodes=episodes or None,
+            episodes=train_episodes,
             video_backend="pyav",
             use_imagenet_stats=False,
         ),
@@ -156,7 +206,7 @@ def main() -> None:
         eval_freq=0,
         log_freq=args.log_freq,
         save_checkpoint=True,
-        save_freq=args.save_freq or args.steps,
+        save_freq=args.save_freq,
         use_policy_training_preset=True,
         policy=policy,
         rename_map={
@@ -165,6 +215,18 @@ def main() -> None:
         },
     )
     train(cfg)
+    if output_dir.exists():
+        shutil.copy2(split_plan_path, output_dir / "split_plan.json")
+
+
+def _expand_episode_spec(spec: str) -> list[int]:
+    spec = spec.strip()
+    if not spec:
+        return []
+    if ":" in spec:
+        start_s, end_s = spec.split(":", 1)
+        return list(range(int(start_s), int(end_s)))
+    return [int(item.strip()) for item in spec.split(",") if item.strip()]
 
 
 if __name__ == "__main__":

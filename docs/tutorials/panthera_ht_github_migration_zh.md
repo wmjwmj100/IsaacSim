@@ -83,7 +83,7 @@ cd isaacsim-panthera
 1. 克隆 Panthera ROS2 资产到 `external/Panthera-HT-ROS2`。
 2. 如果 `_build/linux-x86_64/release/python.sh` 不存在，则执行 `./build.sh --release`。
 3. 启动 `source/standalone_examples/custom/panthera_ht_table.py`。
-4. 在非 headless GUI 模式下打开三个实时相机 viewport：`left_wrist_rgb`、`right_wrist_rgb`、`d435i_rgb`。
+4. 默认启动主 GUI 场景；如需实时相机 viewport，可额外加 `--show-layout-camera-viewports` 打开 `left_wrist_rgb`、`right_wrist_rgb`、`d435i_rgb`。其中 `d435i_rgb` / `d435i_depth` 现在位于桌子对边中点上方 60 厘米，USD Camera orientation 固定为 X=-27、Y=0、Z=180 度。
 
 ### 4. Headless 验证命令
 
@@ -131,4 +131,4 @@ git push -u origin <branch-name>
 
 - 不要把 `external/` 里的 Panthera 资产直接提交；让启动脚本在目标机器上自动拉取，能避免授权和大文件维护问题。
 - 不要把 `outputs/` 作为源码提交；如果需要共享示例数据，建议用 GitHub Release 或对象存储发布小样本。
-- 当前 UGREEN 腕部相机参数是近似/未标定状态；D435i RGB/depth 参数按当前报告写入。要做严格 sim-to-real，请在真实硬件上继续做相机标定和外参验证。
+- 当前 UGREEN 腕部相机外参已使用现场手眼标定结果并转换到 USD Camera 坐标轴；内参仍是近似/未标定状态。D435i RGB/depth 参数按当前报告写入。要做严格 sim-to-real，请在真实硬件上继续做相机内参标定和外参复核。

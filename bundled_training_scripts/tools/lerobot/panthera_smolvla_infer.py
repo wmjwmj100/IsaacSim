@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import contextlib
 import copy
 import json
 import os
@@ -49,17 +48,6 @@ def _feature_shape(feature: Any) -> list[int]:
     return list(getattr(feature, "shape", []))
 
 
-def _image_feature_shapes(cfg: Any) -> dict[str, list[int]]:
-    input_features = getattr(cfg, "input_features", {})
-    if not isinstance(input_features, dict):
-        return {}
-    return {
-        key: _feature_shape(feature)
-        for key, feature in input_features.items()
-        if str(key).startswith("observation.images.")
-    }
-
-
 def _config_type(cfg: Any) -> str:
     value = getattr(cfg, "type", None)
     if value is not None:
@@ -98,10 +86,7 @@ def _iter_stat_values(stats: dict[str, dict[str, Any]] | None) -> list[Any]:
         feature_stats = stats.get(key)
         if not isinstance(feature_stats, dict):
             continue
-        for stat_name, value in feature_stats.items():
-            if stat_name == "count":
-                continue
-            values.append(value)
+        values.extend(feature_stats.values())
     return values
 
 
@@ -291,9 +276,6 @@ def server_loop(args: argparse.Namespace, runtime: dict[str, Any]) -> None:
         "model_id": args.model_id,
         "device": str(runtime["device"]),
         "checkpoint_type": _config_type(runtime["cfg"]),
-        "state_shape": _feature_shape(runtime["cfg"].input_features["observation.state"]),
-        "action_shape": _feature_shape(runtime["cfg"].output_features["action"]),
-        "image_shapes": _image_feature_shapes(runtime["cfg"]),
         "chunk_size": getattr(runtime["cfg"], "chunk_size", None),
         "n_action_steps": getattr(runtime["cfg"], "n_action_steps", None),
         "dataset_stats_loaded": bool(runtime.get("dataset_stats_loaded")),
@@ -316,8 +298,7 @@ def server_loop(args: argparse.Namespace, runtime: dict[str, Any]) -> None:
             request_args.frame_index = request.get("frame_index", args.frame_index)
             request_args.control_mode = request.get("control_mode", args.control_mode)
             request_args.task_text = request.get("task_text", args.task_text)
-            with contextlib.redirect_stdout(sys.stderr):
-                result = run_inference(request_args, runtime)
+            result = run_inference(request_args, runtime)
             print(
                 json.dumps(
                     {"type": "result", "request_id": request.get("request_id"), "result": result},
@@ -350,11 +331,7 @@ def main() -> None:
 
     if not args.server and not args.frame_json:
         parser.error("--frame-json is required unless --server is set")
-    if args.server:
-        with contextlib.redirect_stdout(sys.stderr):
-            runtime = load_runtime(args)
-    else:
-        runtime = load_runtime(args)
+    runtime = load_runtime(args)
     if args.server:
         server_loop(args, runtime)
         return
