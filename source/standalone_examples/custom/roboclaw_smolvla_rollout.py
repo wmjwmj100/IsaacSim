@@ -9,6 +9,7 @@ import struct
 import subprocess
 import sys
 import time
+import uuid
 import zlib
 from pathlib import Path
 
@@ -123,7 +124,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--use-persistent-helper",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=env_flag("ROBOCLAW_USE_PERSISTENT_HELPER", True),
         help="Load SmolVLA once and send per-frame requests over stdin/stdout.",
     )
@@ -249,6 +250,38 @@ def parse_args() -> argparse.Namespace:
         help="Do not modify target object material. Use this when the USD scene must remain visually unchanged.",
     )
     parser.add_argument("--output-dir", default=os.getenv("ROBOCLAW_OUTPUT_DIR", str(DEFAULT_OUTPUT_DIR)))
+    parser.add_argument(
+        "--enable-mcp-vla-bridge",
+        action=argparse.BooleanOptionalAction,
+        default=env_flag("ROBOCLAW_ENABLE_MCP_VLA_BRIDGE", False),
+        help=(
+            "Run a file-bridge server inside Isaac Sim for the isaacsim-vla MCP backend. "
+            "The bridge accepts look_camera and vla_execute requests from Hermes/MCP."
+        ),
+    )
+    parser.add_argument(
+        "--mcp-vla-bridge-dir",
+        default=os.getenv("ROBOCLAW_MCP_VLA_BRIDGE_DIR", str(REPO_ROOT / "outputs/isaacsim_vla_bridge")),
+        help="Shared request/response directory used by ISAACSIM_VLA_BACKEND=file.",
+    )
+    parser.add_argument(
+        "--mcp-vla-bridge-poll-interval",
+        type=float,
+        default=env_float("ROBOCLAW_MCP_VLA_BRIDGE_POLL_INTERVAL", 0.05),
+        help="Seconds between bridge request-directory polls.",
+    )
+    parser.add_argument(
+        "--mcp-vla-bridge-execute-steps",
+        type=int,
+        default=env_int("ROBOCLAW_MCP_VLA_BRIDGE_EXECUTE_STEPS", 12),
+        help="Physics/render steps after each vla_execute command so single-arm targets can settle.",
+    )
+    parser.add_argument(
+        "--mcp-vla-bridge-clear-pending",
+        action=argparse.BooleanOptionalAction,
+        default=env_flag("ROBOCLAW_MCP_VLA_BRIDGE_CLEAR_PENDING", True),
+        help="Clear stale request/response JSON files before starting the bridge.",
+    )
     parser.add_argument("--target-prim-path", default=os.getenv("ROBOCLAW_TARGET_PRIM_PATH", DEFAULT_TARGET_PRIM_PATH))
     parser.add_argument("--target-initial-x", type=float, default=env_float("ROBOCLAW_TARGET_INITIAL_X", float("nan")))
     parser.add_argument("--target-initial-y", type=float, default=env_float("ROBOCLAW_TARGET_INITIAL_Y", float("nan")))
@@ -332,7 +365,14 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("ROBOCLAW_END_EFFECTOR_PRIM_PATH", ""),
         help="Prim used for distance-to-target diagnostics. Defaults to the active arm link6.",
     )
-    return parser.parse_args()
+    parsed_args = parser.parse_args()
+    if (
+        parsed_args.enable_mcp_vla_bridge
+        and not any(arg == "--max-frames" or arg.startswith("--max-frames=") for arg in sys.argv[1:])
+        and "ROBOCLAW_MAX_FRAMES" not in os.environ
+    ):
+        parsed_args.max_frames = 0
+    return parsed_args
 
 
 args = parse_args()
@@ -374,7 +414,9 @@ def json_ready(value):
 
 def write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(json_ready(payload), ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp_path.write_text(json.dumps(json_ready(payload), ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    tmp_path.replace(path)
 
 
 def write_png_rgb(path: Path, rgb: np.ndarray) -> None:
@@ -964,6 +1006,8 @@ def target_metrics(
 
 
 def validate_paths(parsed_args: argparse.Namespace) -> None:
+    if parsed_args.enable_mcp_vla_bridge and parsed_args.replay_json:
+        raise RuntimeError("--enable-mcp-vla-bridge cannot be combined with --replay-json")
     required_files = {
         "usd": Path(parsed_args.usd_path).expanduser(),
     }
@@ -1308,6 +1352,18 @@ def run_smolvla_inference(
     }
     write_json(frame_json_path, frame_payload)
 
+    result = run_smolvla_frame_inference(frame_index, frame_json_path, result_json_path, parsed_args)
+    result["camera1_path"] = str(camera1_path)
+    result["camera2_path"] = str(camera2_path)
+    return result
+
+
+def run_smolvla_frame_inference(
+    frame_index: int,
+    frame_json_path: Path,
+    result_json_path: Path,
+    parsed_args: argparse.Namespace,
+) -> dict[str, object]:
     command = [
         str(Path(parsed_args.smolvla_python).expanduser()),
         str(REPO_ROOT / "tools/lerobot/panthera_smolvla_infer.py"),
@@ -1360,9 +1416,67 @@ def run_smolvla_inference(
     result["helper_latency_s"] = helper_latency_s
     result["frame_json_path"] = str(frame_json_path)
     result["result_json_path"] = str(result_json_path)
-    result["camera1_path"] = str(camera1_path)
-    result["camera2_path"] = str(camera2_path)
     return result
+
+
+def prepare_smolvla_action(
+    result: dict[str, object],
+    policy_joint_unit_mode: str,
+) -> tuple[list[float], list[float]]:
+    raw_model_action = [float(value) for value in result["predicted_action_step0"]]
+    action = action_from_model_units(raw_model_action, policy_joint_unit_mode)
+    result["predicted_action_step0_model_units"] = raw_model_action
+    result["predicted_action_step0_execution_units"] = action
+    result["execution_joint_unit_mode"] = "radians"
+    return raw_model_action, action
+
+
+def apply_vla_action(
+    active_articulation: Articulation,
+    parsed_args: argparse.Namespace,
+    action: list[float],
+    gripper_clip_bounds_execution: tuple[float, float],
+    locked_joint_value: float,
+) -> dict[str, object]:
+    record: dict[str, object] = {
+        "control_mode": parsed_args.control_mode,
+        "applied": False,
+        "action_mapping": action_mapping_summary(
+            action,
+            parsed_args.six_dof_action_layout,
+            parsed_args.locked_joint_name,
+            locked_joint_value,
+        ),
+    }
+    if parsed_args.control_mode != "single-arm":
+        record["reason"] = "control_mode is log-only"
+        return record
+
+    target = action_target_for_articulation(
+        active_articulation,
+        parsed_args,
+        action,
+        gripper_clip_bounds_execution,
+        locked_joint_value,
+    )
+    target = clip_to_dof_limits(active_articulation, target)
+    before_apply = actual_joint_positions_by_name(active_articulation)
+    if parsed_args.robot_replacement == "so100":
+        active_articulation.set_joint_positions(target)
+        active_articulation.set_joint_position_targets(target)
+    else:
+        active_articulation.set_joint_position_targets(target)
+    after_apply = actual_joint_positions_by_name(active_articulation)
+    record.update(
+        {
+            "applied": True,
+            "applied_target": target,
+            "joint_positions_before_apply": before_apply,
+            "joint_positions_after_apply": after_apply,
+            "joint_target_abs_error_after_apply": joint_abs_error_for_target(active_articulation, target),
+        }
+    )
+    return record
 
 
 class PersistentSmolVLAHelper:
@@ -1544,6 +1658,288 @@ def write_policy_frame(
     return frame_json_path, result_json_path
 
 
+def bridge_camera_name(camera_id: str, wrist_name: str) -> str:
+    key = str(camera_id or "top").strip().lower().replace("-", "_")
+    if key in {"top", "overhead", "camera1"}:
+        return "overhead"
+    if key in {"wrist", "active_wrist", "camera2"}:
+        return wrist_name
+    if key in {"left_wrist", "right_wrist"}:
+        return key
+    raise RuntimeError(f"Unsupported camera_id={camera_id!r}. Use top/overhead, wrist, left_wrist, or right_wrist.")
+
+
+def bridge_response_path(response_dir: Path, request_path: Path) -> Path:
+    return response_dir / request_path.name
+
+
+class MCPVLABridge:
+    def __init__(
+        self,
+        *,
+        parsed_args: argparse.Namespace,
+        output_dir: Path,
+        world: World,
+        cameras: dict[str, Camera],
+        active_articulation: Articulation,
+        wrist_name: str,
+        gripper_clip_bounds_execution: tuple[float, float],
+        locked_joint_value: float,
+        policy_joint_unit_mode: str,
+    ) -> None:
+        self.parsed_args = parsed_args
+        self.output_dir = output_dir
+        self.world = world
+        self.cameras = cameras
+        self.active_articulation = active_articulation
+        self.wrist_name = wrist_name
+        self.gripper_clip_bounds_execution = gripper_clip_bounds_execution
+        self.locked_joint_value = locked_joint_value
+        self.policy_joint_unit_mode = policy_joint_unit_mode
+        self.bridge_dir = Path(parsed_args.mcp_vla_bridge_dir).expanduser().resolve()
+        self.requests_dir = self.bridge_dir / "requests"
+        self.responses_dir = self.bridge_dir / "responses"
+        self.frames_dir = output_dir / "mcp_bridge_frames"
+        self._handled: set[str] = set()
+        self._poll_interval = max(0.01, float(parsed_args.mcp_vla_bridge_poll_interval))
+        self._next_poll_at = 0.0
+        self._execute_index = 0
+        self._look_index = 0
+        self.ready_payload: dict[str, object] | None = None
+
+    def start(self) -> None:
+        self.requests_dir.mkdir(parents=True, exist_ok=True)
+        self.responses_dir.mkdir(parents=True, exist_ok=True)
+        self.frames_dir.mkdir(parents=True, exist_ok=True)
+        if bool(self.parsed_args.mcp_vla_bridge_clear_pending):
+            for directory in (self.requests_dir, self.responses_dir):
+                for path in directory.glob("*.json"):
+                    try:
+                        path.unlink()
+                    except OSError as exc:
+                        log(f"[Roboclaw][MCPBridge][WARN] Could not remove stale bridge file {path}: {exc}")
+        log(
+            "[Roboclaw][MCPBridge] Ready. Configure MCP with "
+            f"ISAACSIM_VLA_BACKEND=file ISAACSIM_VLA_BRIDGE_DIR={self.bridge_dir}"
+        )
+        if bool(self.parsed_args.use_persistent_helper):
+            helper = PersistentSmolVLAHelper(self.parsed_args)
+            helper.__enter__()
+            self._persistent_helper = helper
+            self.ready_payload = helper.ready_payload
+
+    def poll(self, frame_index: int) -> list[dict[str, object]]:
+        now = time.monotonic()
+        if now < self._next_poll_at:
+            return []
+        self._next_poll_at = now + self._poll_interval
+
+        records: list[dict[str, object]] = []
+        for request_path in sorted(self.requests_dir.glob("*.json")):
+            if request_path.name in self._handled:
+                continue
+            response_path = bridge_response_path(self.responses_dir, request_path)
+            if response_path.exists():
+                self._handled.add(request_path.name)
+                continue
+            try:
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+
+            record = self._handle_request(request, frame_index)
+            response = record.pop("_bridge_response")
+            write_json(response_path, response)
+            self._handled.add(request_path.name)
+            records.append(record)
+        return records
+
+    def _handle_request(self, request: dict[str, object], frame_index: int) -> dict[str, object]:
+        request_id = str(request.get("request_id") or f"req_{uuid.uuid4().hex[:8]}")
+        operation = str(request.get("operation") or "")
+        payload = request.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        started_at = time.time()
+        try:
+            if operation == "look_camera":
+                result = self._look_camera(request_id, payload, frame_index)
+            elif operation == "vla_execute":
+                result = self._vla_execute(request_id, payload, frame_index)
+            else:
+                raise RuntimeError(f"unsupported operation: {operation}")
+            duration_s = time.time() - started_at
+            result.setdefault("metadata", {})
+            if isinstance(result["metadata"], dict):
+                result["metadata"].update(
+                    {
+                        "request_id": request_id,
+                        "operation": operation,
+                        "bridge_duration_s": duration_s,
+                    }
+                )
+            return {
+                "frame_index": frame_index,
+                "bridge_request_id": request_id,
+                "bridge_operation": operation,
+                "bridge_result": result,
+                "_bridge_response": {"success": True, "result": result},
+            }
+        except Exception as exc:
+            log(f"[Roboclaw][MCPBridge][ERROR] request_id={request_id} operation={operation}: {exc}")
+            error_result = {
+                "success": False,
+                "backend": "isaacsim-file-bridge",
+                "result_id": request_id,
+                "error": str(exc),
+                "metadata": {"request_id": request_id, "operation": operation},
+            }
+            return {
+                "frame_index": frame_index,
+                "bridge_request_id": request_id,
+                "bridge_operation": operation,
+                "bridge_error": str(exc),
+                "_bridge_response": {"success": False, "error": str(exc), "result": error_result},
+            }
+
+    def _look_camera(self, request_id: str, payload: dict[str, object], frame_index: int) -> dict[str, object]:
+        camera_id = str(payload.get("camera_id") or "top")
+        camera_name = bridge_camera_name(camera_id, self.wrist_name)
+        if camera_name not in self.cameras:
+            raise RuntimeError(f"camera {camera_name!r} is not initialized")
+        self._look_index += 1
+        observation_id = f"sim_obs_{frame_index:06d}_{self._look_index:04d}_{uuid.uuid4().hex[:8]}"
+        image_path = self.frames_dir / f"{observation_id}_{camera_name}.png"
+        rgb = camera_rgb(camera_name, self.cameras[camera_name])
+        write_png_rgb(image_path, rgb)
+        height, width = np.asarray(rgb).shape[:2]
+        return {
+            "success": True,
+            "backend": "isaacsim-file-bridge",
+            "result_id": request_id,
+            "observation_id": observation_id,
+            "camera_id": camera_id,
+            "resolved_camera_name": camera_name,
+            "image_path": str(image_path),
+            "width": int(width),
+            "height": int(height),
+            "timestamp": time.time(),
+            "metadata": {
+                "frame_index": frame_index,
+                "camera_source": camera_name,
+                "camera_role": "global" if camera_name == "overhead" else "wrist",
+            },
+        }
+
+    def _vla_execute(self, request_id: str, payload: dict[str, object], frame_index: int) -> dict[str, object]:
+        instruction = str(payload.get("instruction") or self.parsed_args.task_text)
+        atomic_action = payload.get("atomic_action")
+        overlay = payload.get("overlay")
+        if not isinstance(overlay, dict):
+            raise RuntimeError("vla_execute payload must include overlay object from draw_boxes")
+        overlay_path = Path(str(overlay.get("overlay_path") or "")).expanduser()
+        if not overlay_path.is_file():
+            raise RuntimeError(f"overlay_path does not exist: {overlay_path}")
+
+        self._execute_index += 1
+        exec_id = f"sim_exec_{frame_index:06d}_{self._execute_index:04d}_{uuid.uuid4().hex[:8]}"
+        camera_name = bridge_camera_name(str(overlay.get("camera_id") or "top"), self.wrist_name)
+        wrist_camera_name = self.wrist_name
+        if wrist_camera_name not in self.cameras:
+            raise RuntimeError(f"active wrist camera {wrist_camera_name!r} is not initialized")
+
+        camera2_path = self.frames_dir / f"{exec_id}_camera2_{wrist_camera_name}.png"
+        frame_json_path = self.frames_dir / f"{exec_id}.json"
+        result_json_path = self.frames_dir / f"{exec_id}_result.json"
+        frame_state = policy_state_vector(self.active_articulation, self.parsed_args)
+        write_png_rgb(camera2_path, camera_rgb(wrist_camera_name, self.cameras[wrist_camera_name]))
+        frame_payload = {
+            "frame_index": frame_index,
+            "state7": frame_state,
+            "task": instruction,
+            "camera1_path": str(overlay_path),
+            "camera2_path": str(camera2_path),
+            "camera1_source": f"{camera_name}_red_green_overlay",
+            "camera2_source": wrist_camera_name,
+            "active_arm_label": self.parsed_args.active_arm_label,
+            "state_source": policy_state_source_name(self.parsed_args),
+            "control_mode": self.parsed_args.control_mode,
+            "mcp": {
+                "request_id": request_id,
+                "box_layer_id": overlay.get("box_layer_id"),
+                "box_overlay_id": overlay.get("box_overlay_id"),
+                "camera_id": overlay.get("camera_id"),
+                "observation_id": overlay.get("observation_id"),
+                "red_box": overlay.get("red_box"),
+                "green_box": overlay.get("green_box"),
+                "atomic_action": atomic_action,
+            },
+        }
+        write_json(frame_json_path, frame_payload)
+
+        if self.parsed_args.use_persistent_helper:
+            helper = getattr(self, "_persistent_helper", None)
+            if helper is None:
+                helper = PersistentSmolVLAHelper(self.parsed_args)
+                helper.__enter__()
+                self._persistent_helper = helper
+            result = helper.infer(frame_index, frame_json_path, result_json_path, self.parsed_args)
+            result["frame_json_path"] = str(frame_json_path)
+            result["result_json_path"] = str(result_json_path)
+        else:
+            result = run_smolvla_frame_inference(frame_index, frame_json_path, result_json_path, self.parsed_args)
+
+        raw_model_action, action = prepare_smolvla_action(result, self.policy_joint_unit_mode)
+        apply_record = apply_vla_action(
+            self.active_articulation,
+            self.parsed_args,
+            action,
+            self.gripper_clip_bounds_execution,
+            self.locked_joint_value,
+        )
+        settle_steps = max(0, int(self.parsed_args.mcp_vla_bridge_execute_steps))
+        for _ in range(settle_steps):
+            self.world.step(render=True)
+
+        log(
+            f"[Roboclaw][MCPBridge] Executed request_id={request_id} "
+            f"box_layer_id={overlay.get('box_layer_id')} box_overlay_id={overlay.get('box_overlay_id')} "
+            f"action_dim={len(action)} applied={apply_record['applied']}"
+        )
+        return {
+            "success": True,
+            "backend": "isaacsim-file-bridge",
+            "result_id": exec_id,
+            "instruction": instruction,
+            "atomic_action": atomic_action,
+            "box_layer_id": str(overlay.get("box_layer_id") or ""),
+            "box_overlay_id": str(overlay.get("box_overlay_id") or ""),
+            "status": "completed",
+            "predicted_action_step0_model_units": raw_model_action,
+            "predicted_action_step0_execution_units": action,
+            "applied": bool(apply_record.get("applied")),
+            "metadata": {
+                "request_id": request_id,
+                "frame_index": frame_index,
+                "overlay": overlay,
+                "frame_json_path": str(frame_json_path),
+                "result_json_path": str(result_json_path),
+                "camera1_path": str(overlay_path),
+                "camera2_path": str(camera2_path),
+                "smolvla_result": result,
+                "apply_record": apply_record,
+                "settle_steps": settle_steps,
+                "joint_positions_after_settle": actual_joint_positions_by_name(self.active_articulation),
+            },
+        }
+
+    def close(self) -> None:
+        helper = getattr(self, "_persistent_helper", None)
+        if helper is not None:
+            helper.__exit__(None, None, None)
+            self._persistent_helper = None
+
+
 def main() -> None:
     validate_paths(args)
     output_dir = Path(args.output_dir).expanduser() / time.strftime("%Y%m%d_%H%M%S")
@@ -1681,6 +2077,11 @@ def main() -> None:
     log(f"[Roboclaw] DOF names: {active_articulation.dof_names}")
     log(f"[Roboclaw] Camera mapping: camera1=overhead:{paths['overhead']} camera2={wrist_name}:{paths[wrist_name]}")
     log(f"[Roboclaw] Control mode: {args.control_mode}")
+    if args.enable_mcp_vla_bridge:
+        log(
+            "[Roboclaw][MCPBridge] Enabled. The rollout loop will wait for MCP file-bridge requests "
+            "instead of running autonomous inference on infer_interval."
+        )
     log(
         f"[Roboclaw] Policy joint unit mode: {policy_joint_unit_mode} "
         f"source={policy_joint_unit_mode_source} gripper_execution_bounds={gripper_clip_bounds_execution} "
@@ -1742,15 +2143,33 @@ def main() -> None:
     apply_count = 0
     policy_loop_reset_count = 0
     policy_loop_reset_cycle_started_at = time.time()
+    bridge_request_count = 0
+    bridge_execute_count = 0
+    bridge_error_count = 0
     records: list[dict[str, object]] = []
     exit_reason = f"max_frames reached ({max_frames})"
     started_at = time.time()
     persistent_helper: PersistentSmolVLAHelper | None = None
+    mcp_bridge: MCPVLABridge | None = None
     min_ee_to_target_distance_m: float | None = None
     final_ee_to_target_distance_m: float | None = None
 
     try:
-        if args.use_persistent_helper and replay is None:
+        if args.enable_mcp_vla_bridge:
+            mcp_bridge = MCPVLABridge(
+                parsed_args=args,
+                output_dir=output_dir,
+                world=world,
+                cameras=cameras,
+                active_articulation=active_articulation,
+                wrist_name=wrist_name,
+                gripper_clip_bounds_execution=gripper_clip_bounds_execution,
+                locked_joint_value=locked_joint_value,
+                policy_joint_unit_mode=policy_joint_unit_mode,
+            )
+            mcp_bridge.start()
+            helper_ready_payload = mcp_bridge.ready_payload
+        elif args.use_persistent_helper and replay is None:
             persistent_helper = PersistentSmolVLAHelper(args)
             persistent_helper.__enter__()
             helper_ready_payload = persistent_helper.ready_payload
@@ -1809,7 +2228,22 @@ def main() -> None:
                 "end_effector_world_position": end_effector_position,
                 "ee_to_target_distance_m": ee_to_target_distance,
             }
-            if replay is not None:
+            if mcp_bridge is not None:
+                bridge_records = mcp_bridge.poll(frame_index)
+                if bridge_records:
+                    record["mcp_bridge_records"] = bridge_records
+                    bridge_request_count += len(bridge_records)
+                    for bridge_record in bridge_records:
+                        bridge_result = bridge_record.get("bridge_result")
+                        if bridge_record.get("bridge_error"):
+                            bridge_error_count += 1
+                            continue
+                        if bridge_record.get("bridge_operation") == "vla_execute":
+                            bridge_execute_count += 1
+                            inference_count += 1
+                            if isinstance(bridge_result, dict) and bridge_result.get("applied"):
+                                apply_count += 1
+            elif replay is not None:
                 replay_item = replay_record_for_frame(
                     replay,
                     frame_index,
@@ -1876,11 +2310,7 @@ def main() -> None:
                     result["result_json_path"] = str(result_json_path)
                 else:
                     result = run_smolvla_inference(frame_index, frame_state7, cameras, args, output_dir)
-                raw_model_action = [float(value) for value in result["predicted_action_step0"]]
-                action = action_from_model_units(raw_model_action, policy_joint_unit_mode)
-                result["predicted_action_step0_model_units"] = raw_model_action
-                result["predicted_action_step0_execution_units"] = action
-                result["execution_joint_unit_mode"] = "radians"
+                raw_model_action, action = prepare_smolvla_action(result, policy_joint_unit_mode)
                 inference_count += 1
                 record["smolvla_result"] = result
                 record["model_action"] = raw_model_action
@@ -1892,40 +2322,24 @@ def main() -> None:
                     f"[Roboclaw][SmolVLA] Predicted action_dim={len(action)} frame={frame_index} "
                     f"model_units={raw_model_action} execution_radians={action}"
                 )
-                if args.control_mode == "single-arm":
-                    target = action_target_for_articulation(
-                        active_articulation,
-                        args,
-                        action,
-                        gripper_clip_bounds_execution,
-                        locked_joint_value,
-                    )
-                    target = clip_to_dof_limits(active_articulation, target)
-                    before_apply = actual_joint_positions_by_name(active_articulation)
-                    if args.robot_replacement == "so100":
-                        active_articulation.set_joint_positions(target)
-                        active_articulation.set_joint_position_targets(target)
-                    else:
-                        active_articulation.set_joint_position_targets(target)
+                apply_record = apply_vla_action(
+                    active_articulation,
+                    args,
+                    action,
+                    gripper_clip_bounds_execution,
+                    locked_joint_value,
+                )
+                if apply_record["applied"]:
                     apply_count += 1
-                    after_apply = actual_joint_positions_by_name(active_articulation)
-                    target_error_after_apply = joint_abs_error_for_target(active_articulation, target)
-                    record["applied_target"] = target
-                    record["joint_positions_before_apply"] = before_apply
-                    record["joint_positions_after_apply"] = after_apply
-                    record["joint_target_abs_error_after_apply"] = target_error_after_apply
-                    record["action_mapping"] = action_mapping_summary(
-                        action,
-                        args.six_dof_action_layout,
-                        args.locked_joint_name,
-                        locked_joint_value,
-                    )
+                    record.update(apply_record)
                     log(
                         f"[Roboclaw][SmolVLA] Applied single-arm target frame={frame_index} "
-                        f"target={np.asarray(target).reshape(-1).tolist()} "
-                        f"after={after_apply} error={target_error_after_apply}"
+                        f"target={np.asarray(apply_record['applied_target']).reshape(-1).tolist()} "
+                        f"after={apply_record['joint_positions_after_apply']} "
+                        f"error={apply_record['joint_target_abs_error_after_apply']}"
                     )
                 else:
+                    record.update(apply_record)
                     log("[Roboclaw][SmolVLA] log-only: action recorded but not applied")
             records.append(record)
             max_records_in_memory = max(0, int(args.max_records_in_memory))
@@ -1935,6 +2349,8 @@ def main() -> None:
     except KeyboardInterrupt:
         exit_reason = "keyboard interrupt"
     finally:
+        if mcp_bridge is not None:
+            mcp_bridge.close()
         if persistent_helper is not None:
             persistent_helper.__exit__(None, None, None)
         duration_s = time.time() - started_at
@@ -1967,6 +2383,13 @@ def main() -> None:
             "frame_file_ring_size": max(0, int(args.frame_file_ring_size)),
             "max_records_in_memory": max(0, int(args.max_records_in_memory)),
             "keep_open": bool(args.keep_open),
+            "mcp_vla_bridge_enabled": bool(args.enable_mcp_vla_bridge),
+            "mcp_vla_bridge_dir": str(Path(args.mcp_vla_bridge_dir).expanduser().resolve())
+            if args.enable_mcp_vla_bridge
+            else None,
+            "mcp_vla_bridge_request_count": bridge_request_count,
+            "mcp_vla_bridge_execute_count": bridge_execute_count,
+            "mcp_vla_bridge_error_count": bridge_error_count,
             "policy_loop_reset_frames": max(0, int(args.policy_loop_reset_frames)),
             "policy_loop_reset_seconds": max(0.0, float(args.policy_loop_reset_seconds)),
             "policy_loop_reset_settle_frames": max(0, int(args.policy_loop_reset_settle_frames)),

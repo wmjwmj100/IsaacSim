@@ -188,3 +188,16 @@ output/
 *.mov
 *.avi
 *.mkv
+
+# Local runtime artifacts for the Hermes/MCP robotics integration.
+# Keep source checked in, but never commit credentials, virtualenvs, caches, or large local datasets.
+.env
+**/.env
+**/.env.*
+!**/.env.example
+Hermes-Agent/venv/
+Hermes-Agent/.venv/
+mcp/isaacsim_vla/.venv/
+data/
+.venv-lerobot/
+outputs/

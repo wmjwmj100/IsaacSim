@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "isaacsim-vla-mcp"
+version = "0.1.0"
+description = "MCP tools for VLM-to-VLA visual prompt robotics workflows in Isaac Sim."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp==1.26.0",
+  "pydantic==2.13.4",
+  "Pillow==12.2.0",
+  "requests==2.33.0",
+  "starlette==1.0.1",
+]
+
+[project.scripts]
+isaacsim-vla-mcp = "isaacsim_vla.server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["isaacsim_vla*"]

@@ -1,0 +1,33 @@
+# Local IsaacSim/VLA MCP catalog entry.
+manifest_version: 1
+
+name: isaacsim-vla
+description: Visual-prompt robotics tools for Isaac Sim and VLA policies.
+source: file:///work/IsaacSim/mcp/isaacsim_vla
+
+transport:
+  type: stdio
+  command: "/work/IsaacSim/mcp/isaacsim_vla/.venv/bin/isaacsim-vla-mcp"
+
+auth:
+  type: none
+
+tools:
+  default_enabled:
+    - look_camera
+    - draw_boxes
+    - vla_execute
+
+post_install: |
+  Install the local MCP server first:
+    cd /work/IsaacSim/mcp/isaacsim_vla
+    python3 -m venv .venv
+    .venv/bin/pip install -e .
+
+  By default the server runs with ISAACSIM_VLA_BACKEND=mock. For a real Isaac Sim
+  bridge, configure the MCP server entry with explicit env values:
+    ISAACSIM_VLA_BACKEND=file
+    ISAACSIM_VLA_BRIDGE_DIR=/work/IsaacSim/outputs/isaacsim_vla_bridge
+    ISAACSIM_VLA_WORKDIR=/work/IsaacSim/outputs/isaacsim_vla_mcp
+
+  Start a new Hermes session after configuring the MCP.

@@ -1,0 +1,14 @@
+mcp_servers:
+  isaacsim-vla:
+    command: /work/IsaacSim/mcp/isaacsim_vla/.venv/bin/isaacsim-vla-mcp
+    enabled: true
+    env:
+      ISAACSIM_VLA_BACKEND: mock
+      ISAACSIM_VLA_WORKDIR: /work/IsaacSim/outputs/isaacsim_vla_mcp
+      ISAACSIM_VLA_SAMPLE_TOP: /work/IsaacSim/outputs/so100_smolvla_base_gui_smoke3/frame_0000000_infer_000001_up.png
+      ISAACSIM_VLA_SAMPLE_WRIST: /work/IsaacSim/outputs/so100_smolvla_base_gui_smoke3/frame_0000000_infer_000001_wrist.png
+    tools:
+      include:
+        - look_camera
+        - draw_boxes
+        - vla_execute
