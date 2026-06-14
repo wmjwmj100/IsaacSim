@@ -51,6 +51,8 @@ class MockBackend:
                 "overlay_path": overlay.overlay_path,
                 "red_box": overlay.red_box,
                 "green_box": overlay.green_box,
+                "source_box": overlay.source_box or overlay.red_box,
+                "target_box": overlay.target_box or overlay.green_box,
             },
         ).model_dump()
 

@@ -41,18 +41,24 @@ class BoxLayer(BaseModel):
     reference_image_path: str
     preview_overlay_id: str
     preview_overlay_path: str
+    # Backward-compatible names: red_box is the source/object box, rendered green.
+    # green_box is the target/place box, rendered blue.
     red_box: list[int] = Field(min_length=4, max_length=4)
     green_box: list[int] = Field(min_length=4, max_length=4)
+    source_box: list[int] | None = Field(default=None, min_length=4, max_length=4)
+    target_box: list[int] | None = Field(default=None, min_length=4, max_length=4)
     width: int
     height: int
-    red_label: str = "source"
-    green_label: str = "target"
+    red_label: str = ""
+    green_label: str = ""
     created_at: float
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("red_box", "green_box")
+    @field_validator("red_box", "green_box", "source_box", "target_box")
     @classmethod
-    def _validate_layer_box(cls, values: list[int]) -> list[int]:
+    def _validate_layer_box(cls, values: list[int] | None) -> list[int] | None:
+        if values is None:
+            return None
         return Box(values=values).values
 
 
@@ -63,16 +69,22 @@ class BoxOverlay(BaseModel):
     observation_id: str
     original_image_path: str
     overlay_path: str
+    # Backward-compatible names: red_box is the source/object box, rendered green.
+    # green_box is the target/place box, rendered blue.
     red_box: list[int] = Field(min_length=4, max_length=4)
     green_box: list[int] = Field(min_length=4, max_length=4)
+    source_box: list[int] | None = Field(default=None, min_length=4, max_length=4)
+    target_box: list[int] | None = Field(default=None, min_length=4, max_length=4)
     width: int
     height: int
     created_at: float
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("red_box", "green_box")
+    @field_validator("red_box", "green_box", "source_box", "target_box")
     @classmethod
-    def _validate_overlay_box(cls, values: list[int]) -> list[int]:
+    def _validate_overlay_box(cls, values: list[int] | None) -> list[int] | None:
+        if values is None:
+            return None
         return Box(values=values).values
 
 

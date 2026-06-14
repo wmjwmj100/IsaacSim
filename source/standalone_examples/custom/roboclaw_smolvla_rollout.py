@@ -23,14 +23,23 @@ DEFAULT_CHECKPOINT = (
     / ".cache/huggingface/hub/models--lerobot--smolvla_base/snapshots/c83c3163b8ca9b7e67c509fffd9121e66cb96205"
 )
 DEFAULT_SMOLVLA_PYTHON = REPO_ROOT / ".venv-lerobot/bin/python"
-DEFAULT_DATASET_ROOT = REPO_ROOT / "outputs/lerobot_datasets/panthera_ht_merged"
+DEFAULT_DATASET_ROOT = REPO_ROOT / "outputs/lerobot_datasets/roboclaw_data613_vp_30ep"
+DEFAULT_TASK_TEXT = "Pick up the object inside the green box and place it at the location marked by the blue box."
 DEFAULT_VLM_MODEL_PATH = Path(
     "/home/wmj/.cache/huggingface/hub/models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct/"
     "snapshots/7b375e1b73b11138ff12fe22c8f2822d8fe03467"
 )
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs/roboclaw_smolvla_rollout"
+DEFAULT_FINETUNED_CHECKPOINT = (
+    REPO_ROOT
+    / "outputs/train/roboclaw_data613_vp_30ep_smolvla_expert/checkpoints/005000/pretrained_model"
+)
 DEFAULT_TARGET_PRIM_PATH = "/World/Table/TargetCube"
 DEFAULT_REPLAY_JSON = REPO_ROOT / "outputs/roboclaw_dataset_replay/panthera_episode_000000_replay.json"
+DEFAULT_VISUAL_PROMPT_SOURCE_BOX = "380,238,482,310"
+DEFAULT_VISUAL_PROMPT_TARGET_BOX = "242,130,344,202"
+VISUAL_PROMPT_SOURCE_COLOR = (30, 190, 70)
+VISUAL_PROMPT_TARGET_COLOR = (30, 90, 230)
 
 CAMERA_PATHS = {
     "overhead": "/World/RealSenseD435i/DepthCamera",
@@ -62,6 +71,20 @@ def env_int(name: str, default: int) -> int:
 def env_float(name: str, default: float) -> float:
     value = os.getenv(name)
     return float(value) if value else default
+
+
+def parse_box_arg(value: str) -> list[int]:
+    parts = [part.strip() for part in str(value or "").replace(";", ",").split(",") if part.strip()]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("box must have exactly four comma-separated values: x1,y1,x2,y2")
+    try:
+        box = [int(round(float(part))) for part in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("box values must be numbers") from exc
+    x1, y1, x2, y2 = box
+    if x2 <= x1 or y2 <= y1 or x1 < 0 or y1 < 0:
+        raise argparse.ArgumentTypeError("box must satisfy x2>x1, y2>y1, and non-negative coordinates")
+    return box
 
 
 def parse_args() -> argparse.Namespace:
@@ -156,12 +179,36 @@ def parse_args() -> argparse.Namespace:
         default=env_int("ROBOCLAW_POLICY_ALIGN_SETTLE_FRAMES", 3),
         help="Physics/render frames to step after policy initial-state alignment.",
     )
-    parser.add_argument("--smolvla-model-id", default=os.getenv("ROBOCLAW_SMOLVLA_MODEL_ID", str(DEFAULT_CHECKPOINT)))
+    parser.add_argument(
+        "--smolvla-model-id",
+        default=os.getenv(
+            "ROBOCLAW_SMOLVLA_MODEL_ID",
+            str(DEFAULT_FINETUNED_CHECKPOINT if DEFAULT_FINETUNED_CHECKPOINT.is_dir() else DEFAULT_CHECKPOINT),
+        ),
+    )
     parser.add_argument("--smolvla-python", default=os.getenv("ROBOCLAW_SMOLVLA_PYTHON", str(DEFAULT_SMOLVLA_PYTHON)))
     parser.add_argument("--smolvla-device", default=os.getenv("ROBOCLAW_SMOLVLA_DEVICE", "cuda"))
     parser.add_argument("--dataset-root", default=os.getenv("ROBOCLAW_DATASET_ROOT", str(DEFAULT_DATASET_ROOT)))
     parser.add_argument("--vlm-model-path", default=os.getenv("ROBOCLAW_VLM_MODEL_PATH", str(DEFAULT_VLM_MODEL_PATH)))
-    parser.add_argument("--task-text", default=os.getenv("ROBOCLAW_TASK_TEXT", "push the object on the table"))
+    parser.add_argument("--task-text", default=os.getenv("ROBOCLAW_TASK_TEXT", DEFAULT_TASK_TEXT))
+    parser.add_argument(
+        "--enable-policy-visual-prompt",
+        action=argparse.BooleanOptionalAction,
+        default=env_flag("ROBOCLAW_ENABLE_POLICY_VISUAL_PROMPT", False),
+        help="Draw fixed green source and blue target boxes onto camera1 images before SmolVLA inference.",
+    )
+    parser.add_argument(
+        "--visual-prompt-source-box",
+        type=parse_box_arg,
+        default=parse_box_arg(os.getenv("ROBOCLAW_VISUAL_PROMPT_SOURCE_BOX", DEFAULT_VISUAL_PROMPT_SOURCE_BOX)),
+        help="Green source/object box in camera1 pixels: x1,y1,x2,y2.",
+    )
+    parser.add_argument(
+        "--visual-prompt-target-box",
+        type=parse_box_arg,
+        default=parse_box_arg(os.getenv("ROBOCLAW_VISUAL_PROMPT_TARGET_BOX", DEFAULT_VISUAL_PROMPT_TARGET_BOX)),
+        help="Blue target/place box in camera1 pixels: x1,y1,x2,y2.",
+    )
     parser.add_argument(
         "--gripper-clip-lower",
         type=float,
@@ -444,6 +491,52 @@ def write_png_rgb(path: Path, rgb: np.ndarray) -> None:
         + png_chunk(b"IDAT", zlib.compress(raw_rows, level=6))
         + png_chunk(b"IEND", b"")
     )
+
+
+def draw_box_rgb(image: np.ndarray, box: list[int], color: tuple[int, int, int]) -> None:
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in box]
+    x1 = max(0, min(width - 2, x1))
+    y1 = max(0, min(height - 2, y1))
+    x2 = max(x1 + 1, min(width - 1, x2))
+    y2 = max(y1 + 1, min(height - 1, y2))
+    thickness = max(3, int(min(max(x2 - x1, y2 - y1), 300) / 50))
+    rgb_color = np.asarray(color, dtype=np.uint8)
+    for offset in range(thickness):
+        xa = max(0, x1 - offset)
+        ya = max(0, y1 - offset)
+        xb = min(width - 1, x2 + offset)
+        yb = min(height - 1, y2 + offset)
+        image[ya : yb + 1, xa] = rgb_color
+        image[ya : yb + 1, xb] = rgb_color
+        image[ya, xa : xb + 1] = rgb_color
+        image[yb, xa : xb + 1] = rgb_color
+
+
+def camera1_rgb_for_policy(cameras: dict[str, Camera], parsed_args: argparse.Namespace) -> np.ndarray:
+    image = camera_rgb("overhead", cameras["overhead"]).copy()
+    if bool(parsed_args.enable_policy_visual_prompt):
+        draw_box_rgb(image, parsed_args.visual_prompt_source_box, VISUAL_PROMPT_SOURCE_COLOR)
+        draw_box_rgb(image, parsed_args.visual_prompt_target_box, VISUAL_PROMPT_TARGET_COLOR)
+    return image
+
+
+def camera1_source_name(parsed_args: argparse.Namespace) -> str:
+    if bool(parsed_args.enable_policy_visual_prompt):
+        return "overhead_green_blue_overlay"
+    return "overhead"
+
+
+def visual_prompt_metadata(parsed_args: argparse.Namespace) -> dict[str, object] | None:
+    if not bool(parsed_args.enable_policy_visual_prompt):
+        return None
+    return {
+        "source_box": list(parsed_args.visual_prompt_source_box),
+        "target_box": list(parsed_args.visual_prompt_target_box),
+        "source_color_rgb": list(VISUAL_PROMPT_SOURCE_COLOR),
+        "target_color_rgb": list(VISUAL_PROMPT_TARGET_COLOR),
+        "box_color_convention": "source_box_green_target_box_blue",
+    }
 
 
 def camera_rgb(camera_name: str, camera: Camera) -> np.ndarray:
@@ -1336,7 +1429,7 @@ def run_smolvla_inference(
     frame_json_path = frame_dir / f"frame_{file_index:06d}.json"
     result_json_path = frame_dir / f"frame_{file_index:06d}_result.json"
 
-    write_png_rgb(camera1_path, camera_rgb("overhead", cameras["overhead"]))
+    write_png_rgb(camera1_path, camera1_rgb_for_policy(cameras, parsed_args))
     write_png_rgb(camera2_path, camera_rgb(wrist_name, cameras[wrist_name]))
     frame_payload = {
         "frame_index": frame_index,
@@ -1344,12 +1437,15 @@ def run_smolvla_inference(
         "task": parsed_args.task_text,
         "camera1_path": str(camera1_path),
         "camera2_path": str(camera2_path),
-        "camera1_source": "overhead",
+        "camera1_source": camera1_source_name(parsed_args),
         "camera2_source": wrist_name,
         "active_arm_label": parsed_args.active_arm_label,
         "state_source": policy_state_source_name(parsed_args),
         "control_mode": parsed_args.control_mode,
     }
+    visual_prompt = visual_prompt_metadata(parsed_args)
+    if visual_prompt is not None:
+        frame_payload["visual_prompt"] = visual_prompt
     write_json(frame_json_path, frame_payload)
 
     result = run_smolvla_frame_inference(frame_index, frame_json_path, result_json_path, parsed_args)
@@ -1638,23 +1734,24 @@ def write_policy_frame(
     frame_json_path = frame_dir / f"frame_{file_index:06d}.json"
     result_json_path = frame_dir / f"frame_{file_index:06d}_result.json"
 
-    write_png_rgb(camera1_path, camera_rgb("overhead", cameras["overhead"]))
+    write_png_rgb(camera1_path, camera1_rgb_for_policy(cameras, parsed_args))
     write_png_rgb(camera2_path, camera_rgb(wrist_name, cameras[wrist_name]))
-    write_json(
-        frame_json_path,
-        {
-            "frame_index": frame_index,
-            "state7": frame_state7,
-            "task": parsed_args.task_text,
-            "camera1_path": str(camera1_path),
-            "camera2_path": str(camera2_path),
-            "camera1_source": "overhead",
-            "camera2_source": wrist_name,
-            "active_arm_label": parsed_args.active_arm_label,
-            "state_source": policy_state_source_name(parsed_args),
-            "control_mode": parsed_args.control_mode,
-        },
-    )
+    frame_payload = {
+        "frame_index": frame_index,
+        "state7": frame_state7,
+        "task": parsed_args.task_text,
+        "camera1_path": str(camera1_path),
+        "camera2_path": str(camera2_path),
+        "camera1_source": camera1_source_name(parsed_args),
+        "camera2_source": wrist_name,
+        "active_arm_label": parsed_args.active_arm_label,
+        "state_source": policy_state_source_name(parsed_args),
+        "control_mode": parsed_args.control_mode,
+    }
+    visual_prompt = visual_prompt_metadata(parsed_args)
+    if visual_prompt is not None:
+        frame_payload["visual_prompt"] = visual_prompt
+    write_json(frame_json_path, frame_payload)
     return frame_json_path, result_json_path
 
 
@@ -1859,7 +1956,7 @@ class MCPVLABridge:
             "task": instruction,
             "camera1_path": str(overlay_path),
             "camera2_path": str(camera2_path),
-            "camera1_source": f"{camera_name}_red_green_overlay",
+            "camera1_source": f"{camera_name}_green_blue_overlay",
             "camera2_source": wrist_camera_name,
             "active_arm_label": self.parsed_args.active_arm_label,
             "state_source": policy_state_source_name(self.parsed_args),
@@ -1872,6 +1969,8 @@ class MCPVLABridge:
                 "observation_id": overlay.get("observation_id"),
                 "red_box": overlay.get("red_box"),
                 "green_box": overlay.get("green_box"),
+                "source_box": overlay.get("source_box") or overlay.get("red_box"),
+                "target_box": overlay.get("target_box") or overlay.get("green_box"),
                 "atomic_action": atomic_action,
             },
         }
@@ -2076,6 +2175,12 @@ def main() -> None:
     log(f"[Roboclaw] Active arm: {args.active_arm_label} articulation={articulation_path}")
     log(f"[Roboclaw] DOF names: {active_articulation.dof_names}")
     log(f"[Roboclaw] Camera mapping: camera1=overhead:{paths['overhead']} camera2={wrist_name}:{paths[wrist_name]}")
+    if args.enable_policy_visual_prompt:
+        log(
+            "[Roboclaw][VisualPrompt] Enabled for autonomous policy frames: "
+            f"source_box_green={args.visual_prompt_source_box} "
+            f"target_box_blue={args.visual_prompt_target_box}"
+        )
     log(f"[Roboclaw] Control mode: {args.control_mode}")
     if args.enable_mcp_vla_bridge:
         log(
@@ -2454,6 +2559,8 @@ def main() -> None:
                 else None
             ),
             "task_text": args.task_text,
+            "policy_visual_prompt_enabled": bool(args.enable_policy_visual_prompt),
+            "policy_visual_prompt": visual_prompt_metadata(args),
             "target_initial_override": target_initial_override_position,
             "target_metrics": final_target_metrics,
             "end_effector_metrics": {

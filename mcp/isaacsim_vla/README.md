@@ -3,10 +3,10 @@
 This MCP server exposes the robotics tools for the VLM -> visual prompt -> VLA execution loop:
 
 - `look_camera`: capture or fetch a camera observation (`top`, `wrist`, etc.).
-- `draw_boxes`: create one reusable red/green `box_layer_id` on the fixed top camera view.
+- `draw_boxes`: create one reusable green/blue `box_layer_id` on the fixed top camera view.
 - `vla_execute`: execute a simplified instruction against a stored box layer.
 
-The vision model is intentionally outside this MCP. The agent should call a VLM/grounding model once on the initial top camera image to produce `red_box` and `green_box`, then call `draw_boxes` once. Later VLA calls reuse the returned `box_layer_id`; the MCP server fetches the current top frame and renders the same layer onto it automatically. Wrist camera images are never boxed because that camera moves with the gripper.
+The vision model is intentionally outside this MCP. The agent should call a VLM/grounding model once on the initial top camera image to produce `source_box` for the object and `target_box` for the placement region, then call `draw_boxes` once. The source/object box is rendered green and the target/place box is rendered blue, matching the data613 training convention. Later VLA calls reuse the returned `box_layer_id`; the MCP server fetches the current top frame and renders the same layer onto it automatically. Wrist camera images are never boxed because that camera moves with the gripper.
 
 This server is backend-neutral: use `mock` for protocol tests, `file` to bridge a running Isaac Sim process through JSON request/response files, or `http` for a future simulator/robot controller service.
 
@@ -80,12 +80,12 @@ The response should be:
 }
 ```
 
-For `vla_execute`, the backend receives a freshly rendered overlay record, including `overlay_path`, `box_layer_id`, `red_box`, `green_box`, `camera_id`, and `observation_id`.
+For `vla_execute`, the backend receives a freshly rendered overlay record, including `overlay_path`, `box_layer_id`, `source_box`, `target_box`, `camera_id`, and `observation_id`. Legacy `red_box`/`green_box` fields are still present for compatibility, but they now mean source/target, not display colors.
 
 The file bridge is the simulator/robot adapter boundary. The MCP server owns artifact bookkeeping, reusable box layers, and rendering boxes onto the current top image; the adapter only needs to implement:
 
 - `look_camera`: return an image from a logical camera stream.
-- `vla_execute`: run the VLA policy/controller from the resolved red/green overlay.
+- `vla_execute`: run the VLA policy/controller from the resolved green/blue overlay.
 
 This is why `draw_boxes` takes `camera_id`, not a public `image_id`. `camera_id` names the live top stream. `observation_id` is only an optional strict frame binding returned by `look_camera`; pass it when the VLM grounded boxes on that exact initial top frame.
 
@@ -124,7 +124,7 @@ The other fields are preserved as backend metadata so a real robot adapter can a
 Boxes are explicit about coordinate units. Use:
 
 - `coordinate_system: "normalized_1000"` for Doubao/Ark grounding output like `<bbox>x1 y1 x2 y2</bbox>`. These values are normalized to a 1000x1000 coordinate frame in the official `[0, 999]` range, and the MCP converts them to the current image's pixels.
-- `coordinate_system: "pixel"` only when `red_box` and `green_box` are already absolute pixel coordinates for the referenced observation.
+- `coordinate_system: "pixel"` only when `source_box` and `target_box` are already absolute pixel coordinates for the referenced observation.
 
 Request payload:
 
@@ -133,8 +133,8 @@ Request payload:
   "camera_id": "top",
   "observation_id": "optional_initial_top_observation_id",
   "coordinate_system": "normalized_1000",
-  "red_box": [609, 510, 734, 635],
-  "green_box": [656, 281, 859, 416]
+  "source_box": [609, 510, 734, 635],
+  "target_box": [656, 281, 859, 416]
 }
 ```
 
@@ -147,12 +147,13 @@ Response metadata:
   "reference_observation_id": "obs_...",
   "preview_overlay_id": "box_...",
   "preview_overlay_path": "/abs/path/to/preview.png",
-  "red_box": [389, 244, 469, 304],
-  "green_box": [419, 134, 549, 199],
+  "source_box": [389, 244, 469, 304],
+  "target_box": [419, 134, 549, 199],
   "metadata": {
     "coordinate_system": "normalized_1000",
-    "red_box_input": [609, 510, 734, 635],
-    "green_box_input": [656, 281, 859, 416]
+    "source_box_input": [609, 510, 734, 635],
+    "target_box_input": [656, 281, 859, 416],
+    "box_color_convention": "source_box_green_target_box_blue"
   }
 }
 ```
@@ -167,16 +168,16 @@ Request payload:
 
 ```json
 {
-  "instruction": "move the object in the red box to the green box",
+  "instruction": "Pick up the object inside the green box and place it at the location marked by the blue box.",
   "atomic_action": "pick_and_place",
   "overlay": {
     "box_overlay_id": "box_...",
     "box_layer_id": "layer_...",
     "camera_id": "top",
     "observation_id": "obs_...",
-    "overlay_path": "/abs/path/to/red_green_overlay.png",
-    "red_box": [120, 180, 220, 280],
-    "green_box": [430, 160, 560, 300]
+    "overlay_path": "/abs/path/to/green_blue_overlay.png",
+    "source_box": [120, 180, 220, 280],
+    "target_box": [430, 160, 560, 300]
   }
 }
 ```
@@ -189,7 +190,7 @@ Response result:
   "backend": "isaacsim-file-bridge",
   "result_id": "sim_exec_...",
   "status": "completed",
-  "instruction": "move the object in the red box to the green box",
+  "instruction": "Pick up the object inside the green box and place it at the location marked by the blue box.",
   "atomic_action": "pick_and_place",
   "box_layer_id": "layer_...",
   "box_overlay_id": "box_...",
@@ -248,16 +249,16 @@ In bridge mode, Isaac Sim does not run autonomous VLA inference on an interval. 
 ## Typical Agent Flow
 
 1. `look_camera(camera_id="top")`
-2. External VLM grounding returns `red_box` and `green_box`
-3. `draw_boxes(camera_id="top", red_box=[...], green_box=[...])` returns `box_layer_id`
-4. `vla_execute(instruction="move the object in the red box to the green box", box_layer_id="...")`
+2. External VLM grounding returns `source_box` for the object and `target_box` for the placement region.
+3. `draw_boxes(camera_id="top", source_box=[...], target_box=[...])` returns `box_layer_id`
+4. `vla_execute(instruction="Pick up the object inside the green box and place it at the location marked by the blue box.", box_layer_id="...")`
 5. For local progress checks, use `look_camera(camera_id="wrist")` without any box layer.
 6. For a current top debug image with the same layer rendered, use `look_camera(camera_id="top", box_layer_id="...")`.
 
 If the VLM grounded boxes on a specific frame, pass that frame explicitly:
 
 ```text
-draw_boxes(camera_id="top", observation_id="<from look_camera>", red_box=[...], green_box=[...])
+draw_boxes(camera_id="top", observation_id="<from look_camera>", source_box=[...], target_box=[...])
 ```
 
 Do not call `draw_boxes` again unless the top camera moved, the scene was reset, or the original VLM grounding was wrong.

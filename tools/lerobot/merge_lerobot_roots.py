@@ -93,9 +93,10 @@ def _load_episode_table(root: Path, info: dict[str, Any], episode_row: dict[str,
 
 
 def _session_roots(input_root: Path) -> list[Path]:
-    roots = [path for path in sorted(input_root.iterdir()) if (path / "meta" / "info.json").is_file()]
     if (input_root / "meta" / "info.json").is_file():
-        roots = [input_root]
+        return [input_root]
+
+    roots = [path.parent.parent for path in sorted(input_root.glob("**/meta/info.json"))]
     if not roots:
         raise RuntimeError(f"No LeRobot roots found in {input_root}")
     return roots

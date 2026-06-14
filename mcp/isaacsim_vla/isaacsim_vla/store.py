@@ -11,6 +11,9 @@ from PIL import Image, ImageDraw
 
 from .models import BoxLayer, BoxOverlay, CameraObservation
 
+SOURCE_BOX_COLOR = (30, 190, 70)
+TARGET_BOX_COLOR = (30, 90, 230)
+
 
 def now_id(prefix: str) -> str:
     return f"{prefix}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
@@ -88,8 +91,8 @@ class ArtifactStore:
         green_box: list[int],
         coordinate_system: str = "pixel",
         observation_id: str | None = None,
-        label_red: str = "source",
-        label_green: str = "target",
+        label_red: str = "",
+        label_green: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> BoxLayer:
         obs = self.get_observation(observation_id) if observation_id else self.get_latest_observation(camera_id)
@@ -119,6 +122,9 @@ class ArtifactStore:
             "coordinate_system": normalized_coordinate_system,
             "red_box_input": red_box_input,
             "green_box_input": green_box_input,
+            "source_box_input": red_box_input,
+            "target_box_input": green_box_input,
+            "box_color_convention": "source_box_green_target_box_blue",
         }
         layer_id = now_id("layer")
         preview = self._render_boxes(
@@ -139,6 +145,8 @@ class ArtifactStore:
             preview_overlay_path=preview.overlay_path,
             red_box=red_box_pixels,
             green_box=green_box_pixels,
+            source_box=red_box_pixels,
+            target_box=green_box_pixels,
             width=preview.width,
             height=preview.height,
             red_label=label_red,
@@ -158,8 +166,8 @@ class ArtifactStore:
         green_box: list[int],
         coordinate_system: str = "pixel",
         observation_id: str | None = None,
-        label_red: str = "source",
-        label_green: str = "target",
+        label_red: str = "",
+        label_green: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> BoxOverlay:
         layer = self.save_box_layer(
@@ -246,8 +254,8 @@ class ArtifactStore:
             _validate_bounds(red_box, width, height, "red_box")
             _validate_bounds(green_box, width, height, "green_box")
             draw = ImageDraw.Draw(img)
-            _draw_box(draw, red_box, color=(230, 30, 30), label=label_red)
-            _draw_box(draw, green_box, color=(30, 190, 70), label=label_green)
+            _draw_box(draw, red_box, color=SOURCE_BOX_COLOR, label=label_red)
+            _draw_box(draw, green_box, color=TARGET_BOX_COLOR, label=label_green)
             img.save(overlay_path)
         return BoxOverlay(
             box_overlay_id=overlay_id,
@@ -258,6 +266,8 @@ class ArtifactStore:
             overlay_path=str(overlay_path),
             red_box=red_box,
             green_box=green_box,
+            source_box=red_box,
+            target_box=green_box,
             width=width,
             height=height,
             created_at=time.time(),
