@@ -32,7 +32,7 @@ DEFAULT_VLM_MODEL_PATH = Path(
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs/roboclaw_smolvla_rollout"
 DEFAULT_FINETUNED_CHECKPOINT = (
     REPO_ROOT
-    / "outputs/train/roboclaw_data613_vp_30ep_smolvla_expert/checkpoints/005000/pretrained_model"
+    / "outputs/train/roboclaw_data613_vp_30ep_smolvla_expert/checkpoints/020000/pretrained_model"
 )
 DEFAULT_TARGET_PRIM_PATH = "/World/Table/TargetCube"
 DEFAULT_REPLAY_JSON = REPO_ROOT / "outputs/roboclaw_dataset_replay/panthera_episode_000000_replay.json"

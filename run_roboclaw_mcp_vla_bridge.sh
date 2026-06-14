@@ -9,7 +9,7 @@ export ROBOCLAW_MCP_VLA_BRIDGE_DIR="${ROBOCLAW_MCP_VLA_BRIDGE_DIR:-$SCRIPT_DIR/o
 export ROBOCLAW_CONTROL_MODE="${ROBOCLAW_CONTROL_MODE:-single-arm}"
 export ROBOCLAW_MAX_FRAMES="${ROBOCLAW_MAX_FRAMES:-0}"
 export ROBOCLAW_USE_PERSISTENT_HELPER="${ROBOCLAW_USE_PERSISTENT_HELPER:-1}"
-export ROBOCLAW_SMOLVLA_MODEL_ID="${ROBOCLAW_SMOLVLA_MODEL_ID:-$SCRIPT_DIR/outputs/train/roboclaw_data613_vp_30ep_smolvla_expert/checkpoints/005000/pretrained_model}"
+export ROBOCLAW_SMOLVLA_MODEL_ID="${ROBOCLAW_SMOLVLA_MODEL_ID:-$SCRIPT_DIR/outputs/train/roboclaw_data613_vp_30ep_smolvla_expert/checkpoints/020000/pretrained_model}"
 export ROBOCLAW_DATASET_ROOT="${ROBOCLAW_DATASET_ROOT:-$SCRIPT_DIR/outputs/lerobot_datasets/roboclaw_data613_vp_30ep}"
 export ROBOCLAW_TASK_TEXT="${ROBOCLAW_TASK_TEXT:-Pick up the object inside the green box and place it at the location marked by the blue box.}"
 

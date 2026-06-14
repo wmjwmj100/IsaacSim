@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +78,36 @@ def _expand_episode_spec(spec: str) -> list[int] | None:
     return [int(item.strip()) for item in spec.split(",") if item.strip()]
 
 
+def _resolve_resume_config(path: str | Path) -> Path:
+    resume_path = Path(path).expanduser()
+    if resume_path.is_file():
+        if resume_path.name != "train_config.json":
+            raise ValueError(f"Expected a train_config.json file for resume, got: {resume_path}")
+        return resume_path
+
+    if not resume_path.is_dir():
+        raise FileNotFoundError(f"Resume checkpoint path does not exist: {resume_path}")
+
+    candidates = (
+        resume_path / "train_config.json",
+        resume_path / "pretrained_model" / "train_config.json",
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        "Could not find train_config.json under resume path. Expected either "
+        f"{candidates[0]} or {candidates[1]}"
+    )
+
+
+def _ensure_lerobot_resume_arg(config_path: Path) -> None:
+    config_arg = f"--config_path={config_path}"
+    if not any(arg.startswith("--config_path=") for arg in sys.argv[1:]):
+        sys.argv.append(config_arg)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -97,6 +128,15 @@ def main() -> None:
         default=DEFAULT_BASE_CHECKPOINT,
         help="Existing two-camera 7D SmolVLA checkpoint used to initialize this run.",
     )
+    parser.add_argument(
+        "--resume-from",
+        default="",
+        help=(
+            "Resume an existing LeRobot checkpoint. Accepts either a checkpoint directory, "
+            "a pretrained_model directory, or its train_config.json. When set, --base-checkpoint "
+            "is ignored and --steps is interpreted as the total target step count."
+        ),
+    )
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--job-name", default=DEFAULT_JOB_NAME)
     parser.add_argument("--steps", type=int, default=5000)
@@ -113,11 +153,12 @@ def main() -> None:
     dataset_root = Path(args.dataset_root).expanduser()
     base_checkpoint = Path(args.base_checkpoint).expanduser()
     output_dir = Path(args.output_dir).expanduser()
+    resume_config = _resolve_resume_config(args.resume_from) if args.resume_from else None
     episodes = _expand_episode_spec(args.episodes)
 
     if not (dataset_root / "meta" / "info.json").exists():
         raise FileNotFoundError(f"LeRobot dataset root is missing meta/info.json: {dataset_root}")
-    if not (base_checkpoint / "config.json").exists():
+    if resume_config is None and not (base_checkpoint / "config.json").exists():
         raise FileNotFoundError(f"Base checkpoint is missing config.json: {base_checkpoint}")
     if args.overwrite and output_dir.exists():
         shutil.rmtree(output_dir)
@@ -151,6 +192,38 @@ def main() -> None:
     )
     print(f"Image mapping: {top_image_key} -> observation.images.camera1")
     print(f"Image mapping: {side_image_key} -> observation.images.camera2")
+
+    if resume_config is not None:
+        print(f"Resuming training from: {resume_config}")
+        _ensure_lerobot_resume_arg(resume_config)
+        cfg = TrainPipelineConfig.from_pretrained(resume_config)
+        cfg.resume = True
+        cfg.output_dir = output_dir
+        cfg.job_name = args.job_name
+        cfg.steps = args.steps
+        cfg.save_freq = args.save_freq
+        cfg.log_freq = args.log_freq
+        cfg.num_workers = args.num_workers
+        cfg.batch_size = args.batch_size
+        cfg.eval_freq = 0
+        cfg.save_checkpoint = True
+        cfg.dataset = DatasetConfig(
+            repo_id=args.dataset_repo_id,
+            root=str(dataset_root),
+            episodes=episodes,
+            video_backend="pyav",
+            use_imagenet_stats=False,
+        )
+        cfg.rename_map = {
+            top_image_key: "observation.images.camera1",
+            side_image_key: "observation.images.camera2",
+        }
+        cfg.policy.device = args.device
+        cfg.policy.use_amp = False
+        cfg.policy.push_to_hub = False
+        cfg.policy.repo_id = None
+        train(cfg)
+        return
 
     policy.pretrained_path = base_checkpoint
     policy.device = args.device
