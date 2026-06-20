@@ -1,11 +1,11 @@
 mcp_servers:
   isaacsim-vla:
-    command: /work/IsaacSim/mcp/isaacsim_vla/.venv/bin/isaacsim-vla-mcp
+    command: /home/capper/RoboClaw/IsaacSim/mcp/isaacsim_vla/.venv/bin/isaacsim-vla-mcp
     enabled: true
     env:
       ISAACSIM_VLA_BACKEND: file
-      ISAACSIM_VLA_WORKDIR: /work/IsaacSim/outputs/isaacsim_vla_mcp
-      ISAACSIM_VLA_BRIDGE_DIR: /work/IsaacSim/outputs/isaacsim_vla_bridge
+      ISAACSIM_VLA_WORKDIR: /home/capper/RoboClaw/.data/isaacsim_vla_mcp
+      ISAACSIM_VLA_BRIDGE_DIR: /home/capper/RoboClaw/.data/isaacsim_vla_bridge
       ISAACSIM_VLA_TIMEOUT_SEC: "180"
     tools:
       include:

@@ -25,8 +25,9 @@ def _path_env(name: str) -> Path | None:
 
 
 def load_config() -> ServerConfig:
-    repo_root = Path(os.getenv("ISAACSIM_REPO_ROOT", "/work/IsaacSim")).expanduser().resolve()
-    workdir = _path_env("ISAACSIM_VLA_WORKDIR") or (repo_root / "outputs" / "isaacsim_vla_mcp")
+    default_repo_root = Path(__file__).resolve().parents[4]
+    repo_root = Path(os.getenv("ISAACSIM_REPO_ROOT", str(default_repo_root))).expanduser().resolve()
+    workdir = _path_env("ISAACSIM_VLA_WORKDIR") or (repo_root / ".data" / "isaacsim_vla_mcp")
     backend = os.getenv("ISAACSIM_VLA_BACKEND", "mock").strip().lower() or "mock"
     timeout_raw = os.getenv("ISAACSIM_VLA_TIMEOUT_SEC", "120").strip()
     try:

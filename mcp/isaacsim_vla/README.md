@@ -13,7 +13,7 @@ This server is backend-neutral: use `mock` for protocol tests, `file` to bridge 
 ## Install
 
 ```bash
-cd /work/IsaacSim/mcp/isaacsim_vla
+cd /home/capper/RoboClaw/IsaacSim/mcp/isaacsim_vla
 python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
@@ -32,19 +32,19 @@ Manual registration:
 
 ```bash
 hermes mcp add isaacsim-vla \
-  --command /work/IsaacSim/mcp/isaacsim_vla/.venv/bin/isaacsim-vla-mcp \
+  --command /home/capper/RoboClaw/IsaacSim/mcp/isaacsim_vla/.venv/bin/isaacsim-vla-mcp \
   --env ISAACSIM_VLA_BACKEND=mock \
-  --env ISAACSIM_VLA_WORKDIR=/work/IsaacSim/outputs/isaacsim_vla_mcp
+  --env ISAACSIM_VLA_WORKDIR=/home/capper/RoboClaw/.data/isaacsim_vla_mcp
 ```
 
 For the file bridge backend:
 
 ```bash
 hermes mcp add isaacsim-vla \
-  --command /work/IsaacSim/mcp/isaacsim_vla/.venv/bin/isaacsim-vla-mcp \
+  --command /home/capper/RoboClaw/IsaacSim/mcp/isaacsim_vla/.venv/bin/isaacsim-vla-mcp \
   --env ISAACSIM_VLA_BACKEND=file \
-  --env ISAACSIM_VLA_BRIDGE_DIR=/work/IsaacSim/outputs/isaacsim_vla_bridge \
-  --env ISAACSIM_VLA_WORKDIR=/work/IsaacSim/outputs/isaacsim_vla_mcp
+  --env ISAACSIM_VLA_BRIDGE_DIR=/home/capper/RoboClaw/.data/isaacsim_vla_bridge \
+  --env ISAACSIM_VLA_WORKDIR=/home/capper/RoboClaw/.data/isaacsim_vla_mcp
 ```
 
 ## File Bridge Protocol
@@ -204,42 +204,42 @@ Response result:
 
 The current tool is synchronous because Hermes needs a direct action result. A real robot adapter can still execute internally through a job/controller layer and return after completion; the `result_id`, `status`, and `metadata` fields are already shaped so later `get_status`/`cancel` tools can be added without renaming the core tools.
 
-## Isaac Sim Bridge
+## Real-Robot Dry Run
 
-Start the virtual environment bridge:
+Start the real-robot dry-run bridge:
 
 ```bash
-cd /work/IsaacSim
-./run_roboclaw_mcp_vla_bridge.sh --headless
+cd /home/capper/RoboClaw
+./scripts/vla/run_real_robot_mcp_bridge.sh
 ```
 
-This launches `source/standalone_examples/custom/roboclaw_smolvla_rollout.py` in bridge mode. It watches:
+This watches:
 
 ```text
-/work/IsaacSim/outputs/isaacsim_vla_bridge/requests
+/home/capper/RoboClaw/.data/isaacsim_vla_bridge/requests
 ```
 
 and writes responses to:
 
 ```text
-/work/IsaacSim/outputs/isaacsim_vla_bridge/responses
+/home/capper/RoboClaw/.data/isaacsim_vla_bridge/responses
 ```
 
 Then register or run the MCP server with the same bridge directory:
 
 ```bash
 ISAACSIM_VLA_BACKEND=file \
-ISAACSIM_VLA_BRIDGE_DIR=/work/IsaacSim/outputs/isaacsim_vla_bridge \
-ISAACSIM_VLA_WORKDIR=/work/IsaacSim/outputs/isaacsim_vla_mcp \
-/work/IsaacSim/mcp/isaacsim_vla/.venv/bin/isaacsim-vla-mcp
+ISAACSIM_VLA_BRIDGE_DIR=/home/capper/RoboClaw/.data/isaacsim_vla_bridge \
+ISAACSIM_VLA_WORKDIR=/home/capper/RoboClaw/.data/isaacsim_vla_mcp \
+/home/capper/RoboClaw/IsaacSim/mcp/isaacsim_vla/.venv/bin/isaacsim-vla-mcp
 ```
 
-In bridge mode, Isaac Sim does not run autonomous VLA inference on an interval. It waits for the agent sequence: initial `look_camera(top)` -> external VLM grounding -> one `draw_boxes(top)` -> repeated `vla_execute(box_layer_id=...)`.
+In this mode, `vla_execute` runs `./scripts/vla/infer_data613.sh --dry-run` against the live `.data/camera/` files. It validates the real camera files and the SmolVLA path, but sends no robot motion.
 
 ## Environment
 
 - `ISAACSIM_VLA_BACKEND`: `mock`, `file`, or `http`. Default: `mock`.
-- `ISAACSIM_VLA_WORKDIR`: persistent output directory. Default: `/work/IsaacSim/outputs/isaacsim_vla_mcp`.
+- `ISAACSIM_VLA_WORKDIR`: persistent output directory. Default: `./.data/isaacsim_vla_mcp`.
 - `ISAACSIM_VLA_SAMPLE_TOP`: optional image for mock top camera.
 - `ISAACSIM_VLA_SAMPLE_WRIST`: optional image for mock wrist camera.
 - `ISAACSIM_VLA_BRIDGE_DIR`: required for file backend.
