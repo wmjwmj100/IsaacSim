@@ -30,7 +30,7 @@ def _discover_repo_root() -> Path:
 REPO_ROOT = _discover_repo_root()
 DEFAULT_TOP_IMAGE = REPO_ROOT / ".data" / "camera" / "latest_rgb.png"
 DEFAULT_WRIST_IMAGE = REPO_ROOT / ".data" / "camera" / "latest_ugreen_rgb.png"
-DEFAULT_POLICY_PATH = REPO_ROOT / "model" / "pretrained_model"
+DEFAULT_POLICY_PATH = REPO_ROOT / "checkpoint" / "2026-06-14" / "data613" / "pretrained_model"
 DEFAULT_INFER_SCRIPT = REPO_ROOT / "scripts" / "vla" / "infer_data613.sh"
 
 
