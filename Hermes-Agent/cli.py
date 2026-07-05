@@ -3467,7 +3467,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Voice mode state (also reinitialized inside run() for interactive TUI).
         self._voice_lock = threading.Lock()
         self._voice_mode = False
-        self._voice_tts = False
+        self._voice_tts = self._voice_auto_tts_enabled()
         self._voice_recorder = None
         self._voice_recording = False
         self._voice_processing = False
@@ -8946,6 +8946,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             daemon=True,
         ).start()
 
+    @staticmethod
+    def _voice_auto_tts_enabled() -> bool:
+        """Return whether config requests spoken replies by default."""
+        try:
+            from hermes_cli.config import load_config
+
+            raw_voice = load_config().get("voice")
+            voice_config = raw_voice if isinstance(raw_voice, dict) else {}
+            return bool(voice_config.get("auto_tts", False))
+        except Exception:
+            return False
+
     def _voice_speak_response(self, text: str):
         """Speak the agent's response aloud using TTS (runs in background thread)."""
         if not self._voice_tts:
@@ -8979,17 +8991,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 f"tts_{time.strftime('%Y%m%d_%H%M%S')}.mp3",
             )
 
-            text_to_speech_tool(text=tts_text, output_path=mp3_path)
+            result_path = mp3_path
+            result_json = text_to_speech_tool(text=tts_text, output_path=mp3_path)
+            try:
+                result = json.loads(result_json) if isinstance(result_json, str) else {}
+                if isinstance(result, dict) and result.get("success") and result.get("file_path"):
+                    result_path = str(result["file_path"])
+            except Exception:
+                result_path = mp3_path
 
-            # Play the MP3 directly (the TTS tool returns OGG path but MP3 still exists)
-            if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
-                play_audio_file(mp3_path)
+            if os.path.isfile(result_path) and os.path.getsize(result_path) > 0:
+                play_audio_file(result_path)
                 # Clean up
                 try:
-                    os.unlink(mp3_path)
-                    ogg_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
-                    if os.path.isfile(ogg_path):
-                        os.unlink(ogg_path)
+                    for path in {mp3_path, result_path, mp3_path.rsplit(".", 1)[0] + ".ogg"}:
+                        if os.path.isfile(path):
+                            os.unlink(path)
                 except OSError:
                     pass
         except Exception as e:
@@ -10721,7 +10738,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Voice mode state (protected by _voice_lock for cross-thread access)
         self._voice_lock = threading.Lock()
         self._voice_mode = False        # Whether voice mode is enabled
-        self._voice_tts = False         # Whether TTS output is enabled
+        self._voice_tts = self._voice_auto_tts_enabled()  # Whether TTS output is enabled
         self._voice_recorder = None     # AudioRecorder instance (lazy init)
         self._voice_recording = False   # Whether currently recording
         self._voice_processing = False  # Whether STT is in progress

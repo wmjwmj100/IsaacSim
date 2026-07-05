@@ -779,6 +779,8 @@ def speak_text(text: str) -> None:
     _debug(f"speak_text: TTS begin (paused_recording={paused_recording})")
 
     try:
+        import json
+
         from tools.tts_tool import text_to_speech_tool
 
         tts_text = text[:4000] if len(text) > 4000 else text
@@ -807,16 +809,22 @@ def speak_text(text: str) -> None:
         )
 
         _debug(f"speak_text: synthesizing {len(tts_text)} chars -> {mp3_path}")
-        text_to_speech_tool(text=tts_text, output_path=mp3_path)
+        result_path = mp3_path
+        result_json = text_to_speech_tool(text=tts_text, output_path=mp3_path)
+        try:
+            result = json.loads(result_json) if isinstance(result_json, str) else {}
+            if isinstance(result, dict) and result.get("success") and result.get("file_path"):
+                result_path = str(result["file_path"])
+        except Exception:
+            result_path = mp3_path
 
-        if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
-            _debug(f"speak_text: playing {mp3_path} ({os.path.getsize(mp3_path)} bytes)")
-            play_audio_file(mp3_path)
+        if os.path.isfile(result_path) and os.path.getsize(result_path) > 0:
+            _debug(f"speak_text: playing {result_path} ({os.path.getsize(result_path)} bytes)")
+            play_audio_file(result_path)
             try:
-                os.unlink(mp3_path)
-                ogg_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
-                if os.path.isfile(ogg_path):
-                    os.unlink(ogg_path)
+                for path in {mp3_path, result_path, mp3_path.rsplit(".", 1)[0] + ".ogg"}:
+                    if os.path.isfile(path):
+                        os.unlink(path)
             except OSError:
                 pass
         else:

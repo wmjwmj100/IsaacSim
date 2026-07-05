@@ -108,14 +108,14 @@ class ArtifactStore:
             obs.width,
             obs.height,
             normalized_coordinate_system,
-            "red_box",
+            "source_box",
         )
         green_box_pixels = _box_to_pixel_box(
             green_box_input,
             obs.width,
             obs.height,
             normalized_coordinate_system,
-            "green_box",
+            "target_box",
         )
         layer_metadata = {
             **(metadata or {}),
@@ -125,7 +125,12 @@ class ArtifactStore:
             "source_box_input": red_box_input,
             "target_box_input": green_box_input,
             "box_color_convention": "source_box_green_target_box_blue",
+            "validated": False,
+            "validation": None,
         }
+        warnings = _box_warnings(red_box_pixels, green_box_pixels, width=obs.width, height=obs.height)
+        if warnings:
+            layer_metadata["warnings"] = warnings
         layer_id = now_id("layer")
         preview = self._render_boxes(
             obs=obs,
@@ -184,6 +189,27 @@ class ArtifactStore:
 
     def get_box_layer(self, layer_id: str) -> BoxLayer:
         return BoxLayer.model_validate(self.load_json("box_layer", layer_id))
+
+    def confirm_box_layer(
+        self,
+        layer_id: str,
+        *,
+        source_confirmation: str,
+        target_confirmation: str,
+        preview_observation_id: str | None = None,
+    ) -> BoxLayer:
+        layer = self.get_box_layer(layer_id)
+        metadata = dict(layer.metadata)
+        metadata["validated"] = True
+        metadata["validation"] = {
+            "source_confirmation": source_confirmation,
+            "target_confirmation": target_confirmation,
+            "preview_observation_id": preview_observation_id,
+            "validated_at": time.time(),
+        }
+        updated = layer.model_copy(update={"metadata": metadata})
+        self.save_json("box_layer", layer_id, updated.model_dump())
+        return updated
 
     def render_layer_on_observation(
         self,
@@ -251,8 +277,8 @@ class ArtifactStore:
         overlay_path = self.overlays_dir / f"{overlay_id}.png"
         with Image.open(obs.image_path).convert("RGB") as img:
             width, height = img.size
-            _validate_bounds(red_box, width, height, "red_box")
-            _validate_bounds(green_box, width, height, "green_box")
+            _validate_bounds(red_box, width, height, "source_box")
+            _validate_bounds(green_box, width, height, "target_box")
             draw = ImageDraw.Draw(img)
             _draw_box(draw, red_box, color=SOURCE_BOX_COLOR, label=label_red)
             _draw_box(draw, green_box, color=TARGET_BOX_COLOR, label=label_green)
@@ -327,6 +353,27 @@ def _validate_bounds(box: list[int], width: int, height: int, name: str) -> None
     x1, y1, x2, y2 = [int(v) for v in box]
     if x1 < 0 or y1 < 0 or x2 > width or y2 > height or x2 <= x1 or y2 <= y1:
         raise ValueError(f"{name}={box} is outside image bounds {width}x{height}")
+
+
+def _box_warnings(red_box: list[int], green_box: list[int], *, width: int, height: int) -> list[str]:
+    warnings: list[str] = []
+    for name, box in (("source_box", red_box), ("target_box", green_box)):
+        x1, y1, x2, y2 = [int(v) for v in box]
+        area_ratio = ((x2 - x1) * (y2 - y1)) / max(1, width * height)
+        if area_ratio < 0.002:
+            warnings.append(f"{name} is very small relative to the image")
+        if area_ratio > 0.35:
+            warnings.append(f"{name} is very large relative to the image")
+        margin = min(x1, y1, width - x2, height - y2)
+        if margin < min(width, height) * 0.02:
+            warnings.append(f"{name} is close to an image edge")
+    sx1, sy1, sx2, sy2 = [int(v) for v in red_box]
+    tx1, ty1, tx2, ty2 = [int(v) for v in green_box]
+    overlap_w = max(0, min(sx2, tx2) - max(sx1, tx1))
+    overlap_h = max(0, min(sy2, ty2) - max(sy1, ty1))
+    if overlap_w * overlap_h:
+        warnings.append("source_box and target_box overlap")
+    return warnings
 
 
 def _safe_component(value: str) -> str:

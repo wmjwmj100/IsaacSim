@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import requests
-from PIL import Image
+from PIL import Image, ImageStat
 
 from .config import ServerConfig
 from .models import BoxOverlay, ExecutionResult
@@ -91,7 +91,17 @@ class FileBridgeBackend:
         self.responses_dir.mkdir(parents=True, exist_ok=True)
 
     def look_camera(self, camera_id: str) -> dict[str, Any]:
-        return self._roundtrip("look_camera", {"camera_id": camera_id})
+        image_path = self._resolve_live_camera_path(camera_id)
+        self._assert_live_image(image_path)
+        return {
+            "image_path": str(image_path),
+            "camera_id": camera_id,
+            "timestamp": time.time(),
+            "metadata": {
+                "camera_role": "global" if _is_top_camera(camera_id) else "wrist",
+                "bridge_mode": "mcp-local-read",
+            },
+        }
 
     def vla_execute(self, instruction: str, overlay: BoxOverlay, atomic_action: str | None) -> dict[str, Any]:
         return self._roundtrip(
@@ -126,6 +136,27 @@ class FileBridgeBackend:
                 return result
             time.sleep(0.05)
         raise TimeoutError(f"timed out waiting for {response_path}")
+
+    def _resolve_live_camera_path(self, camera_id: str) -> Path:
+        camera_key = str(camera_id or "top").lower()
+        if _is_top_camera(camera_key):
+            return self.cfg.live_top_image
+        if "wrist" in camera_key:
+            return self.cfg.live_wrist_image
+        return self.cfg.live_top_image
+
+    def _assert_live_image(self, path: Path) -> None:
+        if not path.is_file():
+            raise FileNotFoundError(f"camera image does not exist: {path}")
+        if self.cfg.camera_file_max_age > 0.0:
+            age_s = time.time() - path.stat().st_mtime
+            if age_s > self.cfg.camera_file_max_age:
+                raise RuntimeError(f"camera image is stale: {path} age={age_s:.2f}s > {self.cfg.camera_file_max_age:.2f}s")
+        with Image.open(path) as img:
+            stat = ImageStat.Stat(img.convert("L"))
+        mean = float(stat.mean[0]) / 255.0
+        if mean < self.cfg.camera_dark_frame_mean_threshold:
+            raise RuntimeError(f"camera image appears dark: {path} mean={mean:.4f} < {self.cfg.camera_dark_frame_mean_threshold:.4f}")
 
 
 class HttpBackend:
@@ -170,6 +201,10 @@ def build_backend(cfg: ServerConfig, store: ArtifactStore) -> VLABackend:
     if cfg.backend == "http":
         return HttpBackend(cfg, store)
     raise RuntimeError(f"unsupported ISAACSIM_VLA_BACKEND={cfg.backend!r}")
+
+
+def _is_top_camera(camera_id: str) -> bool:
+    return str(camera_id or "").lower() in {"top", "overhead"}
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
